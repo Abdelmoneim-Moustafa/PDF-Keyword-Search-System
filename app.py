@@ -1,453 +1,697 @@
-"""
-PDF Keyword Search — Streamlit Cloud Edition
-Results stored as BYTES inside SQLite (works on ephemeral filesystems).
-No external file storage needed. Downloads served directly from DB.
-"""
-
 import streamlit as st
 import pandas as pd
-import sqlite3, io, time, threading, uuid, json, asyncio, os
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import asyncio
 import aiohttp
-import fitz
+import io
+import time
+import re
+import fitz  # PyMuPDF
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import queue
+import logging
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-DB_PATH     = "jobs.db"          # single file, created in working dir
-CONCURRENCY = 150
-MAX_BYTES   = 524_288            # 512 KB range cap per PDF
-TIMEOUT     = 20
-RETRIES     = 2
-LIMIT       = 50_000
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0",
-      "Accept": "application/pdf,*/*"}
+# ─── Page Config ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="PDF Keyword Search",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ── DB (blobs for results) ─────────────────────────────────────────────────────
-def init_db():
-    c = sqlite3.connect(DB_PATH)
-    c.execute("""CREATE TABLE IF NOT EXISTS jobs(
-        id       TEXT PRIMARY KEY,
-        name     TEXT,
-        filename TEXT,
-        started  TEXT,
-        status   TEXT DEFAULT 'Pending',
-        total    INT  DEFAULT 0,
-        done     INT  DEFAULT 0,
-        found    INT  DEFAULT 0,
-        failed   INT  DEFAULT 0,
-        xlsx_bytes BLOB,
-        csv_bytes  BLOB,
-        err      TEXT,
-        progress TEXT DEFAULT '{}'
-    )""")
-    c.commit(); c.close()
-
-def _db(): return sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
-
-def save_job(j):
-    c = _db()
-    c.execute("""INSERT OR REPLACE INTO jobs
-        (id,name,filename,started,status,total,done,found,failed,err,progress)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (j['id'], j['name'], j['filename'], j['started'], j['status'],
-         j['total'], 0, 0, 0, '', '{}'))
-    c.commit(); c.close()
-
-def upd(jid, **kw):
-    # separate blob fields from normal fields
-    blobs = {k: v for k, v in kw.items() if k in ('xlsx_bytes','csv_bytes')}
-    plain = {k: v for k, v in kw.items() if k not in ('xlsx_bytes','csv_bytes')}
-    c = _db()
-    if plain:
-        c.execute(f"UPDATE jobs SET {','.join(k+'=?' for k in plain)} WHERE id=?",
-                  [*plain.values(), jid])
-    if blobs:
-        for k, v in blobs.items():
-            c.execute(f"UPDATE jobs SET {k}=? WHERE id=?", (v, jid))
-    c.commit(); c.close()
-
-def get_job(jid):
-    c = _db()
-    cur = c.execute("SELECT * FROM jobs WHERE id=?", (jid,))
-    row = cur.fetchone(); cols = [d[0] for d in cur.description]; c.close()
-    return dict(zip(cols, row)) if row else None
-
-def all_jobs():
-    c = _db()
-    # Don't load blobs in list view — too heavy
-    df = pd.read_sql(
-        "SELECT id,name,filename,started,status,total,done,found,failed,err FROM jobs "
-        "ORDER BY started DESC", c)
-    c.close(); return df
-
-def get_blob(jid, col):
-    c = _db()
-    row = c.execute(f"SELECT {col} FROM jobs WHERE id=?", (jid,)).fetchone()
-    c.close(); return bytes(row[0]) if row and row[0] else None
-
-def cleanup():
-    cut = (datetime.now() - timedelta(days=7)).isoformat()
-    c = _db(); c.execute("DELETE FROM jobs WHERE started<?", (cut,))
-    c.commit(); c.close()
-
-# ── Validate ───────────────────────────────────────────────────────────────────
-def validate(df):
-    errs, warns = [], []
-    miss = [col for col in ('URL','Keyword') if col not in df.columns]
-    if miss: errs.append(f"Missing columns: {miss}"); return errs, warns
-    if df.empty: errs.append("File has no data rows.")
-    if len(df) > LIMIT: errs.append(f"Exceeds {LIMIT:,} row limit ({len(df):,} rows)")
-    nu = int(df['URL'].isna().sum())
-    if nu: warns.append(f"{nu} empty URLs will be skipped")
-    return errs, warns
-
-# ── Template ───────────────────────────────────────────────────────────────────
-@st.cache_data
-def make_template() -> bytes:
-    wb = Workbook(); ws = wb.active; ws.title = "Data"
-    hf   = PatternFill("solid", fgColor="1F4E79")
-    hfon = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-    th   = Side(style="thin", color="AAAAAA")
-    bdr  = Border(left=th, right=th, top=th, bottom=th)
-    for i, h in enumerate(["URL","Keyword"], 1):
-        c = ws.cell(1,i,h); c.fill=hf; c.font=hfon; c.border=bdr
-        c.alignment=Alignment(horizontal="center")
-    dfon = Font(name="Arial", size=10)
-    for i,(u,k) in enumerate([
-        ("https://example.com/doc1.pdf", "39131706"),
-        ("https://example.com/doc2.pdf", "EAN13 8013975216323|HS Code 853"),
-        ("https://example.com/doc3.pdf", "keyword1|keyword2|keyword3"),
-    ], 2):
-        for j,v in enumerate([u,k],1):
-            c=ws.cell(i,j,v); c.font=dfon; c.border=bdr
-    ws.column_dimensions['A'].width=60
-    ws.column_dimensions['B'].width=40
-    buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
-
-# ── Search engine ──────────────────────────────────────────────────────────────
-def raw_search(data: bytes, keywords: list) -> dict:
-    text = data.decode("latin-1", errors="replace"); tlow = text.lower(); out = {}
-    for kw in keywords:
-        idx = tlow.find(kw.lower())
-        if idx >= 0:
-            ctx = text[max(0,idx-15):idx+len(kw)+30].replace("\n"," ").strip()
-            out[kw] = ("Found", ctx[:80])
-        else:
-            out[kw] = ("Not Found", None)
-    return out
-
-def pdf_search(data: bytes, keywords: list) -> dict:
-    try:
-        doc  = fitz.open(stream=data, filetype="pdf")
-        text = "".join(p.get_text() for p in doc); doc.close()
-    except Exception:
-        return {kw: ("Error", None) for kw in keywords}
-    tlow = text.lower(); out = {}
-    for kw in keywords:
-        idx = tlow.find(kw.lower())
-        if idx >= 0:
-            ctx = text[max(0,idx-15):idx+len(kw)+30].replace("\n"," ").strip()
-            out[kw] = ("Found", ctx[:80])
-        else:
-            out[kw] = ("Not Found", None)
-    return out
-
-async def search_one(session, sem, url: str, keywords: list, pool) -> tuple:
-    empty = {kw: ("Not Found", None) for kw in keywords}
-    url   = (url or "").strip()
-    if not url or not url.startswith("http"):
-        return empty, "Invalid URL"
-    loop = asyncio.get_event_loop()
-    for attempt in range(RETRIES + 1):
-        try:
-            async with sem:
-                hdrs = {**UA, "Range": f"bytes=0-{MAX_BYTES-1}"}
-                tmo  = aiohttp.ClientTimeout(total=TIMEOUT)
-                async with session.get(url, headers=hdrs, timeout=tmo,
-                                       allow_redirects=True, ssl=False) as r:
-                    if r.status not in (200, 206):
-                        if attempt < RETRIES: await asyncio.sleep(1.5**attempt); continue
-                        return empty, f"HTTP {r.status}"
-                    data = await r.read()
-            if not data: return empty, "Empty"
-            raw = await loop.run_in_executor(pool, raw_search, data, keywords)
-            if all(v[0]=="Found" for v in raw.values()): return raw, "Done"
-            if (b"FlateDecode" in data or b"flatedecode" in data) and \
-               any(v[0]!="Found" for v in raw.values()):
-                full   = await loop.run_in_executor(pool, pdf_search, data, keywords)
-                merged = {kw: raw[kw] if raw[kw][0]=="Found" else full[kw] for kw in keywords}
-                return merged, "Done"
-            return raw, "Done"
-        except asyncio.TimeoutError:
-            if attempt < RETRIES: await asyncio.sleep(1); continue
-            return empty, "Timeout"
-        except Exception as e:
-            if attempt < RETRIES: await asyncio.sleep(1); continue
-            return empty, str(e)[:40]
-    return empty, "Failed"
-
-# ── Async orchestrator ─────────────────────────────────────────────────────────
-async def _run(jid: str, df: pd.DataFrame):
-    job      = get_job(jid)
-    prog     = json.loads(job.get("progress","{}") or "{}")
-    done_set = {int(k) for k in prog}
-    total    = len(df)
-    upd(jid, status="Running", total=total, done=len(done_set),
-        found=sum(1 for v in prog.values() if v.get("us")=="Done"),
-        failed=len(done_set)-sum(1 for v in prog.values() if v.get("us")=="Done"))
-
-    sem  = asyncio.Semaphore(CONCURRENCY)
-    conn = aiohttp.TCPConnector(limit=CONCURRENCY, limit_per_host=30,
-                                ttl_dns_cache=300, enable_cleanup_closed=True)
-    pool = ThreadPoolExecutor(max_workers=8)
-    BATCH = 50
-
-    async with aiohttp.ClientSession(connector=conn) as session:
-        pending = []
-        for idx, row in df.iterrows():
-            if idx in done_set: continue
-            url  = str(row.get("URL","")).strip()
-            kws  = [k.strip() for k in str(row.get("Keyword","")).split("|")
-                    if k.strip()][:3]
-            pending.append((idx, url, kws))
-
-        for b in range(0, len(pending), BATCH):
-            batch = pending[b:b+BATCH]
-            res   = await asyncio.gather(
-                *[search_one(session, sem, url, kws, pool) for (_,url,kws) in batch],
-                return_exceptions=True)
-            for (idx, url, kws), r in zip(batch, res):
-                if isinstance(r, Exception):
-                    kw_res, us = {kw:("Not Found",None) for kw in kws}, str(r)[:40]
-                else:
-                    kw_res, us = r
-                prog[str(idx)] = {
-                    "us": us,
-                    "kw": {k: {"s": v[0], "ctx": v[1]} for k,v in kw_res.items()}
-                }
-            n_done  = len(prog)
-            n_found = sum(1 for v in prog.values() if v.get("us")=="Done")
-            upd(jid, total=total, done=n_done, found=n_found,
-                failed=n_done-n_found, progress=json.dumps(prog))
-
-    pool.shutdown(wait=False)
-
-def build_output(df: pd.DataFrame, prog: dict) -> pd.DataFrame:
-    rows = []
-    for idx, row in df.iterrows():
-        kw_str = str(row.get("Keyword","")).strip()
-        kws    = [k.strip() for k in kw_str.split("|") if k.strip()][:3]
-        p      = prog.get(str(idx), {})
-        us     = p.get("us","Pending")
-        kwr    = p.get("kw", {})
-        for kw in (kws or [kw_str]):
-            r = kwr.get(kw, {"s":"Not Found","ctx":None})
-            rows.append({
-                "URL":                   str(row.get("URL","")),
-                "Keyword":               kw_str,
-                "Extraction Option":     None,
-                "URL_Status":            3 if us=="Done" else 0,
-                "URL_Search_Status":     us,
-                "Keyword_Status":        3.0 if r["s"]=="Found" else 0.0,
-                "feature_name":          kw,
-                "feature_value":         r.get("ctx"),
-                "Keyword_Search_Status": r["s"],
-            })
-    return pd.DataFrame(rows)
-
-def to_xlsx_bytes(df: pd.DataFrame) -> bytes:
-    wb = Workbook(); ws = wb.active; ws.title = "Results"
-    hf   = PatternFill("solid", fgColor="1F4E79")
-    hfon = Font(bold=True, color="FFFFFF", size=10, name="Arial")
-    th   = Side(style="thin", color="CCCCCC")
-    bdr  = Border(left=th, right=th, top=th, bottom=th)
-    gf   = PatternFill("solid", fgColor="C6EFCE")
-    rf   = PatternFill("solid", fgColor="FFCCCC")
-    for i,h in enumerate(df.columns,1):
-        c=ws.cell(1,i,h); c.fill=hf; c.font=hfon; c.border=bdr
-        c.alignment=Alignment(horizontal="center")
-    for ri,row in enumerate(df.itertuples(index=False),2):
-        for ci,val in enumerate(row,1):
-            c=ws.cell(ri,ci,val); c.font=Font(name="Arial",size=9); c.border=bdr
-            if ci==len(df.columns):
-                if str(val)=="Found":
-                    c.fill=gf; c.font=Font(name="Arial",size=9,bold=True,color="276221")
-                elif str(val)=="Not Found":
-                    c.fill=rf; c.font=Font(name="Arial",size=9,color="9C0006")
-    for i,w in enumerate([55,30,18,12,18,15,30,35,22][:len(df.columns)],1):
-        ws.column_dimensions[ws.cell(1,i).column_letter].width=w
-    buf=io.BytesIO(); wb.save(buf); return buf.getvalue()
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
-
-def run_job(jid: str, df: pd.DataFrame):
-    try:
-        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-        loop.run_until_complete(_run(jid, df)); loop.close()
-
-        job   = get_job(jid)
-        prog  = json.loads(job.get("progress","{}") or "{}")
-        out   = build_output(df, prog)
-
-        # ── Store result bytes directly in DB ──────────────────────────────
-        xlsx  = to_xlsx_bytes(out)
-        csv_b = to_csv_bytes(out)
-        upd(jid, status="Done", xlsx_bytes=xlsx, csv_bytes=csv_b)
-
-    except Exception as e:
-        upd(jid, status="Failed", err=str(e)[:500])
-
-# ── UI ─────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="PDF Search", page_icon="🔍", layout="wide")
-
+# ─── Custom CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"]{background:#f5f7fa}
-.block-container{padding:1.5rem 2rem;max-width:1300px}
-.card{background:white;border-radius:12px;padding:18px 22px;
-      box-shadow:0 2px 10px rgba(0,0,0,.07);margin-bottom:12px}
-.big{font-size:2.2rem;font-weight:800;line-height:1}
-.lbl{font-size:.78rem;color:#888;margin-top:4px}
-.tag{display:inline-block;padding:3px 12px;border-radius:20px;
-     font-size:.8rem;font-weight:700;letter-spacing:.3px}
-.done   {background:#dcfce7;color:#166534}
-.running{background:#fef9c3;color:#854d0e}
-.failed {background:#fee2e2;color:#991b1b}
-.pending{background:#f1f5f9;color:#475569}
-.row-card{background:white;border-radius:10px;padding:14px 18px;
-          box-shadow:0 1px 5px rgba(0,0,0,.06);margin-bottom:8px}
+    /* Main theme */
+    .main { background-color: #0f1117; }
+    
+    /* Header card */
+    .header-card {
+        background: linear-gradient(135deg, #1a1f2e 0%, #16213e 100%);
+        border: 1px solid #2d3561;
+        border-radius: 12px;
+        padding: 24px 32px;
+        margin-bottom: 24px;
+    }
+    .header-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #00d4ff;
+        margin: 0;
+    }
+    .header-sub {
+        font-size: 0.95rem;
+        color: #8892a4;
+        margin-top: 4px;
+    }
+
+    /* Stat cards */
+    .stat-card {
+        background: #1a1f2e;
+        border-radius: 10px;
+        padding: 18px 20px;
+        text-align: center;
+        border: 1px solid #2d3561;
+    }
+    .stat-number { font-size: 2rem; font-weight: 800; }
+    .stat-label  { font-size: 0.78rem; color: #8892a4; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+    /* Status badges */
+    .badge-found     { background:#0d4c2b; color:#00e676; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:600; }
+    .badge-notfound  { background:#4c1a0d; color:#ff6b6b; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:600; }
+    .badge-scanned   { background:#2d2600; color:#ffd600; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:600; }
+    .badge-error     { background:#2d0024; color:#f48fb1; padding:3px 10px; border-radius:20px; font-size:0.78rem; font-weight:600; }
+
+    /* Progress area */
+    .progress-box {
+        background: #1a1f2e;
+        border: 1px solid #2d3561;
+        border-radius: 10px;
+        padding: 20px;
+        font-family: monospace;
+        font-size: 0.82rem;
+        color: #b0bec5;
+        max-height: 220px;
+        overflow-y: auto;
+    }
+
+    /* Limit warning */
+    .limit-warning {
+        background: linear-gradient(90deg, #ff6d00, #ff9800);
+        color: white;
+        border-radius: 8px;
+        padding: 10px 20px;
+        font-weight: 700;
+        font-size: 1.1rem;
+        text-align: center;
+        margin: 8px 0;
+    }
+
+    /* Sidebar style */
+    section[data-testid="stSidebar"] {
+        background: #0f1117;
+        border-right: 1px solid #2d3561;
+    }
+
+    /* Button override */
+    .stButton > button {
+        border-radius: 8px;
+        font-weight: 700;
+        transition: all 0.2s;
+    }
+    .stButton > button:hover { transform: translateY(-1px); }
+
+    /* Tab style */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #1a1f2e;
+        border-radius: 8px 8px 0 0;
+        color: #8892a4;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background: #2d3561 !important;
+        color: #00d4ff !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-init_db(); cleanup()
 
-# ── Header ─────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div style='background:linear-gradient(135deg,#1e3a5f,#2563eb);
-     padding:20px 28px;border-radius:14px;color:white;margin-bottom:20px'>
-  <div style='font-size:1.6rem;font-weight:800'>🔍 PDF Keyword Search</div>
-  <div style='opacity:.8;margin-top:4px;font-size:.88rem'>
-    150 parallel connections · 512 KB range · Raw-byte + PyMuPDF · Up to 50,000 rows
-  </div>
-</div>
-""", unsafe_allow_html=True)
+# ─── Constants ───────────────────────────────────────────────────────────────────
+SEARCH_LIMIT = 50_000
+CONCURRENT_DOWNLOADS = 12
+TIMEOUT_SECONDS = 20
 
-# ── Top bar ────────────────────────────────────────────────────────────────────
-t1, t2, t3 = st.columns([1, 2, 1])
-with t1:
-    st.download_button("⬇ Template", make_template(),
-        file_name="search_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True)
-with t2:
-    uf = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"],
-                          label_visibility="collapsed")
-with t3:
-    if st.button("🔄 Refresh", use_container_width=True): st.rerun()
 
-# ── Upload flow ────────────────────────────────────────────────────────────────
-if uf:
+# ─── Core Search Logic ───────────────────────────────────────────────────────────
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, str]:
+    """
+    Extract text from PDF bytes.
+    Returns (text, extraction_status)
+    extraction_status: 'searchable' | 'scanned'
+    """
     try:
-        df = pd.read_excel(uf, dtype=str)
-        errs, warns = validate(df)
-        for w in warns: st.warning(w)
-        if errs:
-            for e in errs: st.error(f"❌ {e}")
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        full_text = []
+        has_text = False
+        for page in doc:
+            txt = page.get_text("text")
+            if txt.strip():
+                has_text = True
+            full_text.append(txt)
+        doc.close()
+
+        if has_text:
+            return "\n".join(full_text), "searchable"
         else:
-            est = max(1, int(len(df) / CONCURRENCY * 7 / 60))
-            c1, c2 = st.columns([4, 1])
-            c1.success(f"✅ {len(df):,} rows · {df['URL'].notna().sum():,} valid URLs  |  "
-                       f"Est. ~{est} min")
-            if c2.button("🚀 Start", type="primary", use_container_width=True):
-                jid  = str(uuid.uuid4())[:8]
-                ts   = datetime.now().strftime("%Y%m%d%H%M%S%f")[:16]
-                name = f"{ts}_{os.path.splitext(uf.name)[0]}"
-                save_job({'id': jid, 'name': name, 'filename': uf.name,
-                          'started': datetime.now().isoformat(),
-                          'status': 'Pending', 'total': len(df)})
-                threading.Thread(
-                    target=run_job, args=(jid, df.copy()), daemon=True).start()
-                st.toast("Job started! 🚀"); time.sleep(0.5); st.rerun()
+            return "", "scanned"
     except Exception as e:
-        st.error(f"❌ {e}")
+        return "", f"error:{e}"
 
-st.markdown("---")
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
-jobs = all_jobs()
-if jobs.empty:
-    st.info("No jobs yet — upload a file above.")
-else:
-    # Metrics
-    m1,m2,m3,m4,m5 = st.columns(5)
-    for col,(v,l,clr) in zip([m1,m2,m3,m4,m5],[
-        (len(jobs),                           "Total",   "#1e3a5f"),
-        ((jobs.status=='Running').sum(),       "Running", "#854d0e"),
-        ((jobs.status=='Done').sum(),          "Done",    "#166534"),
-        ((jobs.status=='Failed').sum(),        "Failed",  "#991b1b"),
-        ((jobs.status=='Pending').sum(),       "Pending", "#475569"),
-    ]):
-        col.markdown(
-            f"<div class='card' style='text-align:center;padding:14px'>"
-            f"<div class='big' style='color:{clr}'>{v}</div>"
-            f"<div class='lbl'>{l}</div></div>", unsafe_allow_html=True)
+def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False) -> tuple[bool, int, list[str]]:
+    """
+    Search keyword in text.
+    Returns (found, count, context_snippets)
+    """
+    if not text or not keyword:
+        return False, 0, []
 
-    # Job rows
-    for _, job in jobs.iterrows():
-        status = job['status']
-        tc     = {'Done':'done','Running':'running','Failed':'failed'}.get(status,'pending')
-        tot    = int(job['total']  or 0)
-        done_n = int(job['done']   or 0)
-        found  = int(job['found']  or 0)
-        fail   = int(job['failed'] or 0)
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.escape(str(keyword).strip())
 
-        with st.container():
-            st.markdown('<div class="row-card">', unsafe_allow_html=True)
-            a, b, c, d, e, f = st.columns([3.5, 1, 1, 1, 1, 2])
+    try:
+        matches = list(re.finditer(pattern, text, flags))
+    except re.error:
+        matches = []
 
-            nm = str(job['name'])
-            a.markdown(f"**{nm[:58]}{'…' if len(nm)>58 else ''}**")
-            b.markdown(f"<span class='tag {tc}'>{status}</span>", unsafe_allow_html=True)
-            c.metric("Rows", f"{tot:,}")
-            d.metric("✓ Found", f"{found:,}")
-            e.metric("✗ Failed", f"{fail:,}")
+    if not matches:
+        return False, 0, []
 
-            if status == 'Done':
-                f1, f2 = f.columns(2)
-                # Load blobs only when job is Done and shown
-                jid = str(job['id'])
-                xlsx_b = get_blob(jid, 'xlsx_bytes')
-                csv_b  = get_blob(jid, 'csv_bytes')
-                ts_part = str(job['started'])[:10].replace('-','')
-                fname   = f"{ts_part}_{job['filename']}"
-                if xlsx_b:
-                    f1.download_button(
-                        "⬇ XLSX", xlsx_b,
-                        file_name=fname.replace('.xlsx','').replace('.csv','') + ".xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"x{jid}")
-                if csv_b:
-                    f2.download_button(
-                        "⬇ CSV", csv_b,
-                        file_name=fname.replace('.xlsx','').replace('.csv','') + ".csv",
-                        mime="text/csv", key=f"c{jid}")
+    snippets = []
+    for m in matches[:3]:
+        start = max(0, m.start() - 60)
+        end = min(len(text), m.end() + 60)
+        snippet = text[start:end].replace("\n", " ").strip()
+        snippets.append(f"…{snippet}…")
 
-            elif status == 'Failed':
-                f.error(str(job.get('err','Error'))[:80])
-            elif status == 'Running':
-                f.markdown(f"⏳ {done_n:,} / {tot:,}")
+    return True, len(matches), snippets
+
+
+def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeout: int) -> dict:
+    """
+    Download a PDF from URL and search for keyword.
+    Returns a result dict.
+    """
+    result = {
+        "URL": url,
+        "Keyword": keyword,
+        "Extraction_Option": "",
+        "URL_Status": None,
+        "URL_Search_Status": "",
+        "Keyword_Status": None,
+        "feature_name": keyword,
+        "feature_value": "",
+        "Keyword_Search_Status": "",
+        "match_count": 0,
+        "context": "",
+    }
+
+    if not url or not str(url).startswith("http"):
+        result["URL_Status"] = 0
+        result["URL_Search_Status"] = "Invalid URL"
+        result["Keyword_Search_Status"] = "Invalid URL"
+        return result
+
+    import requests
+    try:
+        resp = requests.get(url, timeout=session_timeout, stream=True)
+        if resp.status_code != 200:
+            result["URL_Status"] = resp.status_code
+            result["URL_Search_Status"] = f"HTTP {resp.status_code}"
+            result["Keyword_Search_Status"] = f"HTTP {resp.status_code}"
+            return result
+
+        content_type = resp.headers.get("content-type", "")
+        pdf_bytes = resp.content
+
+    except requests.exceptions.Timeout:
+        result["URL_Status"] = 0
+        result["URL_Search_Status"] = "Timeout"
+        result["Keyword_Search_Status"] = "Timeout"
+        return result
+    except Exception as e:
+        result["URL_Status"] = 0
+        result["URL_Search_Status"] = f"Download Error: {str(e)[:60]}"
+        result["Keyword_Search_Status"] = f"Download Error: {str(e)[:60]}"
+        return result
+
+    # Attempt text extraction
+    text, extraction_status = extract_text_from_pdf_bytes(pdf_bytes)
+
+    if "error:" in extraction_status:
+        result["URL_Status"] = 3
+        result["URL_Search_Status"] = "Done"
+        result["Keyword_Search_Status"] = f"PDF Not mirrored / Corrupted"
+        return result
+
+    result["URL_Status"] = 3
+    result["URL_Search_Status"] = "Done"
+
+    if extraction_status == "scanned":
+        result["Keyword_Search_Status"] = (
+            "PDF is Non searchable,"
+            "Advanced Scanned Extraction can make the PDF searchable."
+        )
+        result["Keyword_Status"] = None
+        return result
+
+    # Keyword search
+    found, count, snippets = search_keyword_in_text(text, keyword, case_sensitive)
+
+    result["Keyword_Status"] = 3.0
+    result["match_count"] = count
+
+    if found:
+        result["Keyword_Search_Status"] = "Found"
+        result["feature_value"] = "; ".join(snippets[:2])
+        result["context"] = "; ".join(snippets)
+    else:
+        result["Keyword_Search_Status"] = "Not Found"
+
+    return result
+
+
+# ─── Streamlit App ────────────────────────────────────────────────────────────────
+
+def render_header():
+    st.markdown("""
+    <div class="header-card">
+        <div class="header-title">🔍 PDF Keyword Search</div>
+        <div class="header-sub">Fast, concurrent keyword search across thousands of PDF URLs</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_stat_cards(total, found, not_found, scanned, errors):
+    cols = st.columns(5)
+    stats = [
+        (total,     "#00d4ff", "Total"),
+        (found,     "#00e676", "Found"),
+        (not_found, "#ff6b6b", "Not Found"),
+        (scanned,   "#ffd600", "Scanned"),
+        (errors,    "#f48fb1", "Errors"),
+    ]
+    for col, (val, color, label) in zip(cols, stats):
+        with col:
+            st.markdown(f"""
+            <div class="stat-card">
+                <div class="stat-number" style="color:{color}">{val:,}</div>
+                <div class="stat-label">{label}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Results")
+    return output.getvalue()
+
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def apply_status_badge(val):
+    if val == "Found":
+        return "background-color:#0d4c2b; color:#00e676"
+    elif val == "Not Found":
+        return "background-color:#4c1a0d; color:#ff6b6b"
+    elif "Non searchable" in str(val):
+        return "background-color:#2d2600; color:#ffd600"
+    elif val in ("Timeout", "Invalid URL") or "Error" in str(val) or "HTTP" in str(val):
+        return "background-color:#2d0024; color:#f48fb1"
+    return ""
+
+
+# ─── Session State ────────────────────────────────────────────────────────────────
+if "results_df" not in st.session_state:
+    st.session_state.results_df = None
+if "running" not in st.session_state:
+    st.session_state.running = False
+
+
+# ─── Sidebar ─────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+
+    st.markdown(f"""
+    <div class="limit-warning">⚠️ Limit: {SEARCH_LIMIT:,}</div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 🔧 Search Options")
+
+    workers = st.slider("Concurrent Workers", 4, 40, CONCURRENT_DOWNLOADS, 2,
+                        help="More workers = faster, but uses more memory")
+    timeout = st.slider("Per-URL Timeout (sec)", 5, 60, TIMEOUT_SECONDS, 5)
+    case_sensitive = st.checkbox("Case-Sensitive Search", value=False)
+    output_format = st.radio("Output Format", ["Excel (.xlsx)", "CSV (.csv)"], index=0)
+
+    st.markdown("---")
+    st.markdown("### 📋 Template")
+    template_df = pd.DataFrame({"URL": ["https://example.com/file.pdf"], "Keyword": ["your keyword"]})
+    st.download_button(
+        "⬇️ Download Template",
+        data=df_to_excel_bytes(template_df),
+        file_name="PDF_Keyword_Search_Template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    st.markdown("---")
+    st.markdown("### ℹ️ Status Guide")
+    st.markdown("""
+    - 🟢 **Found** — Keyword located in PDF  
+    - 🔴 **Not Found** — PDF searchable, keyword absent  
+    - 🟡 **Scanned** — Non-searchable / image PDF  
+    - 🔵 **Error** — Download or parse failure  
+    """)
+
+
+# ─── Main Content ─────────────────────────────────────────────────────────────────
+render_header()
+
+tab_search, tab_results, tab_guide = st.tabs(["🔍 Search", "📊 Results", "📖 Guide"])
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 1 — SEARCH
+# ══════════════════════════════════════════════════════════════════
+with tab_search:
+    col_upload, col_info = st.columns([2, 1])
+
+    with col_upload:
+        st.markdown("### 📁 Upload Input File")
+        st.markdown("Upload an Excel or CSV with **`URL`** and **`Keyword`** columns.")
+        uploaded_file = st.file_uploader(
+            "Drop your file here",
+            type=["xlsx", "xls", "csv"],
+            label_visibility="collapsed",
+        )
+
+    with col_info:
+        st.markdown("### 📌 Required Columns")
+        st.markdown("""
+        | Column | Description |
+        |--------|-------------|
+        | `URL` | Direct link to PDF file |
+        | `Keyword` | Term to search for |
+        """)
+
+    if uploaded_file:
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                input_df = pd.read_csv(uploaded_file)
             else:
-                f.markdown(f"⏳ Queued")
+                input_df = pd.read_excel(uploaded_file)
 
-            if status == 'Running' and tot > 0:
-                pct = done_n / tot
-                st.progress(pct, text=f"⚡ {done_n:,} / {tot:,}  ({pct*100:.1f}%)")
+            # Normalize column names
+            input_df.columns = [c.strip() for c in input_df.columns]
+            # Accept 'Offline' as URL column (matches the uploaded sample)
+            if "URL" not in input_df.columns and "Offline" in input_df.columns:
+                input_df.rename(columns={"Offline": "URL"}, inplace=True)
 
-            st.markdown('</div>', unsafe_allow_html=True)
+            missing = [c for c in ["URL", "Keyword"] if c not in input_df.columns]
+            if missing:
+                st.error(f"❌ Missing columns: **{', '.join(missing)}**. Found: {input_df.columns.tolist()}")
+            else:
+                input_df = input_df.dropna(subset=["URL"]).reset_index(drop=True)
+                total_rows = len(input_df)
 
-# Auto-refresh while active
-if not jobs.empty and jobs['status'].isin(['Running','Pending']).any():
-    time.sleep(3); st.rerun()
+                st.success(f"✅ File loaded — **{total_rows:,}** rows detected")
+
+                if total_rows > SEARCH_LIMIT:
+                    st.warning(f"⚠️ File has {total_rows:,} rows. Only the first **{SEARCH_LIMIT:,}** will be processed.")
+                    input_df = input_df.head(SEARCH_LIMIT)
+
+                with st.expander("🔎 Preview Input (first 10 rows)", expanded=False):
+                    st.dataframe(input_df.head(10), use_container_width=True)
+
+                st.markdown("---")
+                col_btn1, col_btn2, col_btn3 = st.columns([2, 1, 1])
+
+                with col_btn1:
+                    start_btn = st.button(
+                        "🚀 Start Search",
+                        use_container_width=True,
+                        type="primary",
+                        disabled=st.session_state.running,
+                    )
+
+                with col_btn2:
+                    stop_btn = st.button("⏹ Stop", use_container_width=True)
+
+                if stop_btn:
+                    st.session_state.running = False
+
+                if start_btn and not st.session_state.running:
+                    st.session_state.running = True
+                    st.session_state.results_df = None
+
+                    total = len(input_df)
+                    rows = input_df.to_dict("records")
+
+                    # ── Progress UI ──────────────────────────────────────────
+                    prog_bar = st.progress(0, text="Initializing…")
+                    status_text = st.empty()
+                    log_area = st.empty()
+                    metrics_area = st.empty()
+
+                    results = []
+                    completed = 0
+                    log_lines = []
+
+                    start_time = time.time()
+
+                    def log(msg):
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        log_lines.append(f"[{ts}] {msg}")
+                        if len(log_lines) > 80:
+                            log_lines.pop(0)
+
+                    log(f"Starting search for {total:,} URLs with {workers} workers…")
+
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {
+                            executor.submit(
+                                process_one_url,
+                                str(row.get("URL", "")),
+                                str(row.get("Keyword", "")),
+                                case_sensitive,
+                                timeout,
+                            ): row
+                            for row in rows
+                        }
+
+                        for future in as_completed(futures):
+                            if not st.session_state.running:
+                                log("⏹ Stopped by user.")
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                break
+
+                            try:
+                                res = future.result()
+                                results.append(res)
+                                completed += 1
+
+                                status = res["Keyword_Search_Status"]
+                                url_short = res["URL"][-50:] if len(res["URL"]) > 50 else res["URL"]
+                                log(f"[{completed}/{total}] {status:12s} → …{url_short}")
+
+                            except Exception as e:
+                                completed += 1
+                                log(f"[{completed}/{total}] EXCEPTION: {e}")
+
+                            # Update UI every N records
+                            if completed % max(1, min(20, total // 50)) == 0 or completed == total:
+                                pct = completed / total
+                                elapsed = time.time() - start_time
+                                rate = completed / elapsed if elapsed > 0 else 0
+                                eta_sec = (total - completed) / rate if rate > 0 else 0
+
+                                prog_bar.progress(pct, text=f"Processing {completed:,}/{total:,}  •  {rate:.1f} URLs/sec  •  ETA {eta_sec:.0f}s")
+                                status_text.markdown(
+                                    f"⏱ **Elapsed:** {elapsed:.1f}s  |  "
+                                    f"**Speed:** {rate:.1f} URLs/s  |  "
+                                    f"**Done:** {completed:,}/{total:,}"
+                                )
+
+                                # Live log
+                                log_area.markdown(
+                                    f'<div class="progress-box">' +
+                                    "<br>".join(log_lines[-30:]) +
+                                    "</div>",
+                                    unsafe_allow_html=True,
+                                )
+
+                    st.session_state.running = False
+
+                    # Build results DataFrame
+                    if results:
+                        out_cols = [
+                            "URL", "Keyword", "Extraction_Option",
+                            "URL_Status", "URL_Search_Status",
+                            "Keyword_Status", "feature_name",
+                            "feature_value", "Keyword_Search_Status",
+                        ]
+                        results_df = pd.DataFrame(results)
+                        # Rename to match expected output
+                        results_df.rename(columns={"Extraction_Option": "Extraction Option"}, inplace=True)
+                        out_cols[2] = "Extraction Option"
+                        st.session_state.results_df = results_df[out_cols]
+
+                        elapsed_total = time.time() - start_time
+                        prog_bar.progress(1.0, text="✅ Search Complete!")
+                        st.success(
+                            f"✅ Finished **{completed:,}** URLs in **{elapsed_total:.1f}s** "
+                            f"({completed/elapsed_total:.1f} URLs/sec)"
+                        )
+                    else:
+                        st.warning("No results collected.")
+
+        except Exception as e:
+            st.error(f"❌ Failed to load file: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 2 — RESULTS
+# ══════════════════════════════════════════════════════════════════
+with tab_results:
+    df = st.session_state.results_df
+
+    if df is None:
+        st.info("🔍 Run a search first to see results here.")
+    else:
+        # Summary stats
+        total    = len(df)
+        found    = (df["Keyword_Search_Status"] == "Found").sum()
+        not_fnd  = (df["Keyword_Search_Status"] == "Not Found").sum()
+        scanned  = df["Keyword_Search_Status"].str.contains("Non searchable", na=False).sum()
+        errors   = total - found - not_fnd - scanned
+
+        st.markdown("### 📊 Summary")
+        render_stat_cards(total, found, not_fnd, scanned, errors)
+
+        st.markdown("---")
+
+        # Filters
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            status_filter = st.multiselect(
+                "Filter by Status",
+                options=df["Keyword_Search_Status"].unique().tolist(),
+                default=df["Keyword_Search_Status"].unique().tolist(),
+            )
+        with col_f2:
+            kw_filter = st.text_input("Filter by Keyword (contains)", "")
+
+        filtered = df[df["Keyword_Search_Status"].isin(status_filter)]
+        if kw_filter:
+            filtered = filtered[filtered["Keyword"].astype(str).str.contains(kw_filter, case=False, na=False)]
+
+        st.markdown(f"**Showing {len(filtered):,} rows**")
+
+        # Styled table
+        display_df = filtered[[
+            "URL", "Keyword", "Extraction Option",
+            "URL_Status", "URL_Search_Status",
+            "Keyword_Status", "feature_name", "feature_value",
+            "Keyword_Search_Status",
+        ]].copy()
+
+        styled = display_df.style.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
+        st.dataframe(styled, use_container_width=True, height=450)
+
+        # Download
+        st.markdown("---")
+        st.markdown("### ⬇️ Download Results")
+        col_dl1, col_dl2 = st.columns(2)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        with col_dl1:
+            xlsx_bytes = df_to_excel_bytes(filtered)
+            st.download_button(
+                "📥 Download Excel (.xlsx)",
+                data=xlsx_bytes,
+                file_name=f"keyword_search_results_{timestamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+
+        with col_dl2:
+            csv_bytes = df_to_csv_bytes(filtered)
+            st.download_button(
+                "📥 Download CSV (.csv)",
+                data=csv_bytes,
+                file_name=f"keyword_search_results_{timestamp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        # Chart
+        st.markdown("---")
+        st.markdown("### 📈 Search Result Distribution")
+        chart_data = df["Keyword_Search_Status"].value_counts().reset_index()
+        chart_data.columns = ["Status", "Count"]
+        st.bar_chart(chart_data.set_index("Status"))
+
+
+# ══════════════════════════════════════════════════════════════════
+# TAB 3 — GUIDE
+# ══════════════════════════════════════════════════════════════════
+with tab_guide:
+    st.markdown("""
+    ## 📖 User Guide
+
+    ### How to Use
+
+    1. **Download the Template** from the sidebar  
+    2. **Fill your data** — each row needs:
+       - `URL` → Direct link to a PDF file  
+       - `Keyword` → The term you want to find  
+    3. **Upload the file** on the Search tab  
+    4. **Configure Settings** in the sidebar (workers, timeout, case)  
+    5. **Click Start Search** and watch the live progress  
+    6. **View results** on the Results tab and **Download** when done  
+
+    ---
+
+    ### Output Columns Explained
+
+    | Column | Description |
+    |--------|-------------|
+    | `URL` | Original PDF URL |
+    | `Keyword` | Search term used |
+    | `Extraction Option` | Extraction method used |
+    | `URL_Status` | HTTP/connection status code |
+    | `URL_Search_Status` | "Done" if PDF was processed |
+    | `Keyword_Status` | Numeric code (3.0 = processed) |
+    | `feature_name` | The keyword searched |
+    | `feature_value` | Matched context snippet |
+    | `Keyword_Search_Status` | **Main result**: Found / Not Found / PDF Non-searchable / Error |
+
+    ---
+
+    ### Status Values
+
+    | Status | Meaning |
+    |--------|---------|
+    | ✅ `Found` | Keyword was found in the PDF text |
+    | ❌ `Not Found` | PDF is searchable but keyword was absent |
+    | 🟡 `PDF is Non searchable…` | Image-based / scanned PDF (no text layer) |
+    | 🔴 `PDF Not mirrored / Corrupted` | File is damaged or unreadable |
+    | 🔴 `HTTP 404`, `Timeout`, etc. | Network or server errors |
+
+    ---
+
+    ### Performance Tips
+
+    - Increase **Workers** for faster processing (up to 40)  
+    - Reduce **Timeout** for faster failures on bad URLs  
+    - Process in batches of **5,000–15,000** for best reliability  
+    - The system limit is **50,000 URLs** per run  
+
+    ---
+
+    ### Notes
+
+    - Only **PDF files** are supported  
+    - **Scanned PDFs** (image-only) cannot be searched without OCR  
+    - Search is **not case-sensitive** by default  
+    - Results preserve the **same column structure** as the system output  
+    """)
