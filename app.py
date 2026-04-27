@@ -1,16 +1,11 @@
 import streamlit as st
 import pandas as pd
-import asyncio
-import aiohttp
 import io
 import time
 import re
 import fitz  # PyMuPDF
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
-import queue
-import logging
 
 # ─── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(
