@@ -1,120 +1,141 @@
-# 🔍 PDF Keyword Search System
+# 🔍 PDF Keyword Search — Streamlit App
 
-A Streamlit web application that searches PDF files for keywords using direct URL access.
+A fast, concurrent PDF keyword search tool that processes thousands of PDF URLs and reports whether a keyword was found.
 
-## ✨ Features
+---
 
-- **Upload Excel files** with URLs and keywords (up to 50,000 rows)
-- **Multi-keyword search**: Use `|` to separate up to 3 keywords per row (e.g. `keyword1|keyword2|keyword3`)
-- **Download results** as both XLSX and CSV
-- **Live progress tracking** with auto-refresh
-- **Resumable jobs**: If internet interrupts, job resumes from where it stopped
-- **Auto-cleanup**: Files older than 7 days are deleted automatically
-- **Validation**: File structure and limit checks before processing
+## ✅ Features
 
-## 📁 Excel File Structure
+- Upload Excel / CSV with `URL` + `Keyword` columns  
+- Concurrent multi-threaded downloading (up to 40 workers)  
+- Searches text-based PDFs using PyMuPDF  
+- Detects scanned/image-only PDFs  
+- Live progress bar + speed metrics  
+- Filter, view, and download results as Excel or CSV  
+- **Limit: 50,000 URLs per run**  
 
-Your upload file must have exactly these columns:
-
-| Column | Required | Description | Example |
-|--------|----------|-------------|---------|
-| `URL` | ✅ | Direct link to PDF | `https://example.com/file.pdf` |
-| `Keyword` | ✅ | Keyword(s) separated by `\|` | `39131706\|EAN 1234\|barcode` |
-
-**Download the template** from the app to get a pre-formatted file.
-
-## 📤 Output File Structure
-
-Results are saved with the same base name as your upload:
-
-| Column | Description |
-|--------|-------------|
-| `URL` | Original URL |
-| `Keyword` | Original keyword string |
-| `Extraction Option` | (blank) |
-| `URL_Status` | 3=success, 0=failed |
-| `URL_Search_Status` | Done / Timeout / HTTP 404 / etc |
-| `Keyword_Status` | 3.0=found, 0.0=not found |
-| `feature_name` | The specific keyword searched |
-| `feature_value` | Text context where keyword was found |
-| `Keyword_Search_Status` | Found / Not Found |
-
-## 🚀 Quick Start
-
-### Option 1: Run Locally
-
-```bash
-# 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/pdf-keyword-search.git
-cd pdf-keyword-search
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Run
-streamlit run app.py
-```
-
-Then open http://localhost:8501 in your browser.
-
-### Option 2: Deploy on Streamlit Cloud (Free)
-
-1. Push this repo to GitHub
-2. Go to https://share.streamlit.io
-3. Connect your GitHub account
-4. Select this repo, branch: `main`, file: `app.py`
-5. Click **Deploy** — done!
+---
 
 ## 📂 Project Structure
 
 ```
-pdf-keyword-search/
-├── app.py              ← Main Streamlit application (run this)
-├── requirements.txt    ← Python dependencies
-├── README.md           ← This file
-├── .gitignore          ← Git ignore rules
-├── database/           ← SQLite DB (auto-created)
-│   └── jobs.db
-├── uploads/            ← Uploaded Excel files (auto-cleaned weekly)
-└── results/            ← Result XLSX/CSV files (auto-cleaned weekly)
+keyword_search_app/
+├── app.py               ← Main Streamlit application
+├── requirements.txt     ← Python dependencies
+└── README.md            ← This file
 ```
 
-## 🔧 How It Works
+---
 
-1. **Upload**: You upload an Excel file with URLs and keywords
-2. **Validate**: System checks columns, row limit (50k), and data quality
-3. **Process**: Each PDF URL is downloaded and searched for keywords
-4. **Resume**: If connection drops, job saves progress and resumes when restarted
-5. **Download**: Results available as XLSX (formatted) or CSV
+## 🚀 Setup & Run
 
-## 💡 Tips
+### 1. Install Python (3.9+)
 
-- **Multiple keywords**: Use `|` between them — e.g. `barcode|EAN|GTIN`
-- **Large files**: The system processes in background — refresh the page to check progress
-- **Slow PDFs**: Each PDF has a 30-second timeout with 3 retry attempts
-- **File naming**: Results are named `TIMESTAMP_OriginalFileName.xlsx/csv`
-
-## 🗄️ Database
-
-Jobs are tracked in a local SQLite database (`database/jobs.db`). Each job stores:
-- Job ID, name, upload time, status
-- Progress (row by row, persisted as JSON)
-- Result file paths
-
-**Cleanup**: Jobs and files older than 7 days are deleted automatically on startup.
-
-## ⚙️ Configuration
-
-Edit these constants at the top of `app.py`:
-
-```python
-LIMIT = 50000        # Max rows per upload
-MAX_FEATURES = 3     # Max keywords per row (pipe-separated)
+Make sure Python is installed:
+```bash
+python --version
 ```
 
-## 🌐 Streamlit Cloud Notes
+### 2. Create a virtual environment (recommended)
 
-When deployed on Streamlit Cloud:
-- Files persist between sessions within the same deployment
-- For production use with large volumes, consider a persistent database (PostgreSQL) and object storage (S3/GCS)
-- The free tier allows 1 app with 1 GB RAM
+```bash
+python -m venv venv
+
+# Windows:
+venv\Scripts\activate
+
+# Mac/Linux:
+source venv/bin/activate
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Run the app
+
+```bash
+streamlit run app.py
+```
+
+The app will open in your browser at `http://localhost:8501`
+
+---
+
+## ☁️ Deploy to GitHub + Streamlit Cloud
+
+### Step 1 — Push to GitHub
+
+```bash
+git init
+git add .
+git commit -m "Initial commit: PDF Keyword Search app"
+git remote add origin https://github.com/YOUR_USERNAME/pdf-keyword-search.git
+git push -u origin main
+```
+
+### Step 2 — Deploy on Streamlit Cloud
+
+1. Go to [share.streamlit.io](https://share.streamlit.io)  
+2. Click **New app**  
+3. Select your GitHub repo  
+4. Set **Main file path** to `app.py`  
+5. Click **Deploy**  
+
+---
+
+## 📋 Input File Format
+
+Your Excel or CSV must have these columns:
+
+| URL | Keyword |
+|-----|---------|
+| https://example.com/document.pdf | 51712160148 |
+| https://example.com/report.pdf | 4015081636822 |
+
+---
+
+## 📤 Output Columns
+
+| Column | Description |
+|--------|-------------|
+| `URL` | Original PDF URL |
+| `Keyword` | Keyword searched |
+| `Extraction Option` | Method used |
+| `URL_Status` | Status code (3=OK, 4=Non-searchable) |
+| `URL_Search_Status` | "Done" if processed |
+| `Keyword_Status` | 3.0 if keyword was checked |
+| `feature_name` | Keyword searched |
+| `feature_value` | Matched context snippet |
+| `Keyword_Search_Status` | **Main result** (see below) |
+
+### Keyword_Search_Status Values
+
+| Value | Meaning |
+|-------|---------|
+| `Found` | Keyword found in PDF |
+| `Not Found` | PDF searchable, keyword absent |
+| `PDF is Non searchable, Advanced Scanned Extraction can make the PDF searchable.` | Image/scanned PDF |
+| `PDF Not mirrored / Corrupted` | File is unreadable |
+| `HTTP 404`, `Timeout`, etc. | Network errors |
+
+---
+
+## ⚙️ Settings (Sidebar)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Concurrent Workers | 12 | Parallel downloads |
+| Per-URL Timeout | 20s | Max wait per URL |
+| Case-Sensitive | Off | Toggle case matching |
+| Output Format | Excel | Excel or CSV download |
+
+---
+
+## 🛠 Requirements
+
+- Python 3.9+
+- Internet access (to download PDFs)
+- At least 2GB RAM for large batches
