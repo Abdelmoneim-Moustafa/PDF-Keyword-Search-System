@@ -587,7 +587,11 @@ with tab_results:
             "Keyword_Search_Status",
         ]].copy()
 
-        styled = display_df.style.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
+        styler = display_df.style
+        if hasattr(styler, "map"):
+            styled = styler.map(apply_status_badge, subset=["Keyword_Search_Status"])
+        else:
+            styled = styler.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
         st.dataframe(styled, use_container_width=True, height=450)
 
         # Download
