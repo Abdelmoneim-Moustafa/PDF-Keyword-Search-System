@@ -587,12 +587,11 @@ with tab_results:
             "Keyword_Search_Status",
         ]].copy()
 
-        styler = display_df.style
-        if hasattr(styler, "map"):
-            styled = styler.map(apply_status_badge, subset=["Keyword_Search_Status"])
+        if len(display_df) <= 5000:
+            styled = display_df.style.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
+            st.dataframe(styled, use_container_width=True, height=450)
         else:
-            styled = styler.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
-        st.dataframe(styled, use_container_width=True, height=450)
+            st.dataframe(display_df, use_container_width=True, height=450)
 
         # Download
         st.markdown("---")
