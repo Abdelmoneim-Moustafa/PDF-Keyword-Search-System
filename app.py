@@ -149,7 +149,9 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, str]:
 def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False) -> tuple[bool, int, list[str]]:
     """
     Search keyword in text.
-    Returns (found, count, context_snippets)
+    Returns (found, count, matched_line_snippets)
+    Each snippet is the trimmed LINE containing the match (not a wide context window).
+    Duplicate lines are deduplicated while preserving order.
     """
     if not text or not keyword:
         return False, 0, []
@@ -166,21 +168,75 @@ def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False
         return False, 0, []
 
     snippets = []
-    for m in matches[:3]:
-        start = max(0, m.start() - 60)
-        end = min(len(text), m.end() + 60)
-        snippet = text[start:end].replace("\n", " ").strip()
-        snippets.append(f"…{snippet}…")
+    seen = set()
+    for m in matches:
+        # Expand to the nearest newlines to get the full line
+        line_start = text.rfind("\n", 0, m.start())
+        line_start = line_start + 1 if line_start != -1 else 0
+        line_end = text.find("\n", m.end())
+        line_end = line_end if line_end != -1 else len(text)
+        line = text[line_start:line_end].strip()
+        if line and line not in seen:
+            seen.add(line)
+            snippets.append(line)
 
     return True, len(matches), snippets
 
 
-def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeout: int) -> dict:
+def _get_alternate_url(url: str) -> str:
+    """Return alternate mirror URL by swapping source <-> source1 host."""
+    if "//source1.z2data.com" in url:
+        return url.replace("//source1.z2data.com", "//source.z2data.com", 1)
+    if "//source.z2data.com" in url:
+        return url.replace("//source.z2data.com", "//source1.z2data.com", 1)
+    return ""
+
+
+def _download_pdf(url: str, session_timeout: int):
+    """
+    Attempt to download URL content.
+    Returns (pdf_bytes, error_msg). On success error_msg is None.
+    """
+    import requests
+    try:
+        resp = requests.get(url, timeout=session_timeout, stream=True)
+        if resp.status_code != 200:
+            return None, f"HTTP {resp.status_code}"
+        return resp.content, None
+    except requests.exceptions.Timeout:
+        return None, "Timeout"
+    except Exception as e:
+        return None, f"Download Error: {str(e)[:80]}"
+
+
+def _build_context_snippet(text: str, keyword: str, context_chars: int = 100) -> str:
+    """
+    Build a context snippet around the first occurrence of keyword in text.
+    Returns '…<up-to context_chars chars before>keyword<up-to context_chars chars after>…'
+    matching the Check_System format.
+    """
+    if not text or not keyword:
+        return ""
+    idx = text.lower().find(str(keyword).lower())
+    if idx == -1:
+        return ""
+    start = max(0, idx - context_chars)
+    end = min(len(text), idx + len(str(keyword)) + context_chars)
+    snippet = text[start:end].strip()
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeout: int) -> list:
     """
     Download a PDF from URL and search for keyword.
-    Returns a result dict.
+    On download failure, retries once with the alternate mirror host.
+    If both attempts fail, the raw error/timeout message is surfaced in
+    URL_Search_Status and Keyword_Search_Status (URL_Status=0).
+    Always returns exactly ONE row per URL+Keyword pair.
     """
-    result = {
+    base = {
         "URL": url,
         "Keyword": keyword,
         "Extraction_Option": "",
@@ -188,75 +244,71 @@ def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeou
         "URL_Search_Status": "",
         "Keyword_Status": None,
         "feature_name": keyword,
-        "feature_value": "",
+        "feature_value": None,
         "Keyword_Search_Status": "",
         "match_count": 0,
         "context": "",
     }
 
+    def make_row(**overrides):
+        r = dict(base)
+        r.update(overrides)
+        return r
+
     if not url or not str(url).startswith("http"):
-        result["URL_Status"] = 0
-        result["URL_Search_Status"] = "Invalid URL"
-        result["Keyword_Search_Status"] = "Invalid URL"
-        return result
+        return [make_row(URL_Status=0, URL_Search_Status="Invalid URL", Keyword_Search_Status="Invalid URL")]
 
-    import requests
-    try:
-        resp = requests.get(url, timeout=session_timeout, stream=True)
-        if resp.status_code != 200:
-            result["URL_Status"] = resp.status_code
-            result["URL_Search_Status"] = f"HTTP {resp.status_code}"
-            result["Keyword_Search_Status"] = f"HTTP {resp.status_code}"
-            return result
+    # --- Primary download attempt ---
+    pdf_bytes, err = _download_pdf(url, session_timeout)
 
-        content_type = resp.headers.get("content-type", "")
-        pdf_bytes = resp.content
+    # --- Retry with alternate mirror on any failure (covers Download Error & Timeout) ---
+    if pdf_bytes is None:
+        alt_url = _get_alternate_url(url)
+        if alt_url:
+            pdf_bytes, err = _download_pdf(alt_url, session_timeout)
 
-    except requests.exceptions.Timeout:
-        result["URL_Status"] = 0
-        result["URL_Search_Status"] = "Timeout"
-        result["Keyword_Search_Status"] = "Timeout"
-        return result
-    except Exception as e:
-        result["URL_Status"] = 0
-        result["URL_Search_Status"] = f"Download Error: {str(e)[:60]}"
-        result["Keyword_Search_Status"] = f"Download Error: {str(e)[:60]}"
-        return result
+    # --- Bug fix: surface the real error message instead of hiding it ---
+    # Both primary and alternate mirror failed: report the actual error
+    if pdf_bytes is None:
+        error_msg = err if err else "Download Error: Unknown"
+        return [make_row(URL_Status=0, URL_Search_Status=error_msg,
+                         Keyword_Search_Status=error_msg)]
 
-    # Attempt text extraction
+    # --- Text extraction ---
     text, extraction_status = extract_text_from_pdf_bytes(pdf_bytes)
 
     if "error:" in extraction_status:
-        result["URL_Status"] = 3
-        result["URL_Search_Status"] = "Done"
-        result["Keyword_Search_Status"] = f"PDF Not mirrored / Corrupted"
-        return result
-
-    result["URL_Status"] = 3
-    result["URL_Search_Status"] = "Done"
+        return [make_row(URL_Status=0, URL_Search_Status="PDF Not mirrored / Corrupted",
+                         Keyword_Search_Status="PDF Not mirrored / Corrupted")]
 
     if extraction_status == "scanned":
-        result["Keyword_Search_Status"] = (
+        # Bug fix: scanned PDFs use URL_Status=3 / URL_Search_Status="Done" (not 4/error)
+        msg = (
             "PDF is Non searchable,"
             "Advanced Scanned Extraction can make the PDF searchable."
         )
-        result["Keyword_Status"] = None
-        return result
+        return [make_row(URL_Status=3, URL_Search_Status="Done",
+                         Keyword_Search_Status=msg, Keyword_Status=None)]
 
-    # Keyword search
+    # --- Keyword search on searchable PDF ---
     found, count, snippets = search_keyword_in_text(text, keyword, case_sensitive)
 
-    result["Keyword_Status"] = 3.0
-    result["match_count"] = count
-
     if found:
-        result["Keyword_Search_Status"] = "Found"
-        result["feature_value"] = "; ".join(snippets[:2])
-        result["context"] = "; ".join(snippets)
+        # Bug fix: one row per URL+Keyword pair with a ~100-char context window
+        # around the first match (matching Check_System feature_value format)
+        context_snippet = _build_context_snippet(text, keyword, context_chars=100)
+        return [make_row(
+            URL_Status=3,
+            URL_Search_Status="Done",
+            Keyword_Status=3.0,
+            match_count=count,
+            feature_value=context_snippet,
+            Keyword_Search_Status="Found",
+            context=context_snippet,
+        )]
     else:
-        result["Keyword_Search_Status"] = "Not Found"
-
-    return result
+        return [make_row(URL_Status=3, URL_Search_Status="Done", Keyword_Status=3.0,
+                         Keyword_Search_Status="Not Found")]
 
 
 # ─── Streamlit App ────────────────────────────────────────────────────────────────
@@ -389,9 +441,9 @@ with tab_search:
     if uploaded_file:
         try:
             if uploaded_file.name.endswith(".csv"):
-                input_df = pd.read_csv(uploaded_file)
+                input_df = pd.read_csv(uploaded_file, dtype={"Keyword": str})
             else:
-                input_df = pd.read_excel(uploaded_file)
+                input_df = pd.read_excel(uploaded_file, dtype={"Keyword": str})
 
             # Normalize column names
             input_df.columns = [c.strip() for c in input_df.columns]
@@ -478,10 +530,12 @@ with tab_search:
                                 break
 
                             try:
-                                res = future.result()
-                                results.append(res)
+                                rows = future.result()
+                                results.extend(rows)
                                 completed += 1
 
+                                # Use first row for status logging
+                                res = rows[0]
                                 status = res["Keyword_Search_Status"]
                                 url_short = res["URL"][-50:] if len(res["URL"]) > 50 else res["URL"]
                                 log(f"[{completed}/{total}] {status:12s} → …{url_short}")
