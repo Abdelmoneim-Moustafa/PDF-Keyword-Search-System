@@ -642,7 +642,9 @@ with tab_results:
         ]].copy()
 
         if len(display_df) <= 5000:
-            styled = display_df.style.applymap(apply_status_badge, subset=["Keyword_Search_Status"])
+            # pandas >= 2.1 renamed Styler.applymap → Styler.map; fall back gracefully
+            _styler_fn = getattr(display_df.style, "map", None) or display_df.style.applymap
+            styled = _styler_fn(apply_status_badge, subset=["Keyword_Search_Status"])
             st.dataframe(styled, use_container_width=True, height=450)
         else:
             st.dataframe(display_df, use_container_width=True, height=450)
