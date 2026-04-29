@@ -115,17 +115,134 @@ st.markdown("""
 
 # ─── Constants ───────────────────────────────────────────────────────────────────
 SEARCH_LIMIT = 50_000
-CONCURRENT_DOWNLOADS = 12
+CONCURRENT_DOWNLOADS = 6  # Lowered: fewer workers = less likely to trigger z2data rate limits
 TIMEOUT_SECONDS = 20
 
 
 # ─── Core Search Logic ───────────────────────────────────────────────────────────
 
+import threading
+import random
+
+# ─── Thread-local requests Session (connection pooling per worker thread) ──────
+_thread_local = threading.local()
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    # Referer is required — z2data.com silently drops connections without it
+    "Referer": "https://source.z2data.com/",
+}
+
+# Separate connect timeout to avoid blocking workers on slow TCP handshakes
+_CONNECT_TIMEOUT = 15
+
+# ─── Global rate-limiter: enforces minimum delay between requests ─────────────
+# Prevents z2data.com from triggering rate-limiting / connection bans.
+# All worker threads share this lock so the delay is per-server, not per-thread.
+import threading as _threading
+_rate_lock = _threading.Lock()
+_last_request_time: dict[str, float] = {}   # host → last request timestamp
+_MIN_DELAY_SECS = 0.25   # 250 ms min between any two requests to the same host
+
+def _rate_limit(url: str):
+    """Sleep if needed so we don't hammer the same host too fast."""
+    try:
+        host = url.split("/")[2]
+    except IndexError:
+        return
+    with _rate_lock:
+        last = _last_request_time.get(host, 0)
+        gap = time.time() - last
+        if gap < _MIN_DELAY_SECS:
+            time.sleep(_MIN_DELAY_SECS - gap)
+        _last_request_time[host] = time.time()
+
+# ─── Blocked-server detector ──────────────────────────────────────────────────
+# Tracks consecutive failures per host. When a host fails >= threshold times
+# in a row, all threads pause for a cooling-off period before retrying.
+_block_lock = _threading.Lock()
+_consecutive_failures: dict[str, int] = {}   # host → count
+_host_blocked_until: dict[str, float] = {}   # host → unblock timestamp
+_BLOCK_THRESHOLD = 5       # consecutive failures before declaring "blocked"
+_BLOCK_COOLDOWN_SECS = 30  # seconds to wait when blocked is detected
+
+def _record_failure(host: str):
+    with _block_lock:
+        _consecutive_failures[host] = _consecutive_failures.get(host, 0) + 1
+        if _consecutive_failures[host] >= _BLOCK_THRESHOLD:
+            _host_blocked_until[host] = time.time() + _BLOCK_COOLDOWN_SECS
+            _consecutive_failures[host] = 0  # reset counter after triggering cooldown
+
+def _record_success(host: str):
+    with _block_lock:
+        _consecutive_failures[host] = 0
+
+def _wait_if_blocked(host: str):
+    """Block the calling thread until the host's cooldown expires."""
+    until = _host_blocked_until.get(host, 0)
+    wait = until - time.time()
+    if wait > 0:
+        time.sleep(wait)
+
+
+def _make_session():
+    """
+    Create a brand-new requests.Session.
+
+    KEY DESIGN DECISIONS:
+    ─────────────────────
+    1. urllib3 Retry(total=0)  — we disable urllib3 internal retries entirely.
+       When urllib3 exhausts its own counter it raises MaxRetriesError which
+       our except-clause catches as ONE failure, so our app-level backoff loop
+       never runs.  With total=0 every single TCP attempt surfaces immediately
+       and our loop stays in full control.
+
+    2. raise_on_status=False — HTTP 4xx/5xx arrive as a response object, not
+       an exception, so we can decide per-status whether to retry or give up.
+
+    3. pool_connections/pool_maxsize=20 — matches max worker count so workers
+       never queue waiting for a socket slot.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+    no_retry = Retry(total=0, raise_on_status=False)
+    adapter = HTTPAdapter(
+        max_retries=no_retry,
+        pool_connections=20,
+        pool_maxsize=20,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _get_session(fresh: bool = False):
+    """
+    Return the per-thread Session, creating a new one when requested.
+    Pass fresh=True after a connection error to discard a poisoned pool.
+    """
+    if fresh or not hasattr(_thread_local, "session"):
+        _thread_local.session = _make_session()
+    return _thread_local.session
+
+
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, str]:
     """
     Extract text from PDF bytes.
     Returns (text, extraction_status)
-    extraction_status: 'searchable' | 'scanned'
+    extraction_status: 'searchable' | 'scanned' | 'error:<msg>'
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -137,7 +254,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, str]:
                 has_text = True
             full_text.append(txt)
         doc.close()
-
         if has_text:
             return "\n".join(full_text), "searchable"
         else:
@@ -146,11 +262,57 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> tuple[str, str]:
         return "", f"error:{e}"
 
 
+def _extract_text_from_html_bytes(html_bytes: bytes) -> tuple[str, str]:
+    """
+    Extract plain text from HTML bytes using html.parser (stdlib, no extra deps).
+    Falls back gracefully if decoding fails.
+    Returns (text, 'searchable') or ('', 'error:<msg>')
+    """
+    try:
+        from html.parser import HTMLParser
+
+        class _TextExtractor(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.parts = []
+                self._skip = False
+
+            def handle_starttag(self, tag, attrs):
+                if tag in ("script", "style", "noscript"):
+                    self._skip = True
+
+            def handle_endtag(self, tag):
+                if tag in ("script", "style", "noscript"):
+                    self._skip = False
+
+            def handle_data(self, data):
+                if not self._skip:
+                    stripped = data.strip()
+                    if stripped:
+                        self.parts.append(stripped)
+
+        # Detect encoding
+        for enc in ("utf-8", "latin-1", "cp1252"):
+            try:
+                html_str = html_bytes.decode(enc)
+                break
+            except Exception:
+                html_str = None
+        if not html_str:
+            html_str = html_bytes.decode("utf-8", errors="replace")
+
+        parser = _TextExtractor()
+        parser.feed(html_str)
+        text = "\n".join(parser.parts)
+        return (text, "searchable") if text.strip() else ("", "scanned")
+    except Exception as e:
+        return "", f"error:{e}"
+
+
 def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False) -> tuple[bool, int, list[str]]:
     """
     Search keyword in text.
     Returns (found, count, matched_line_snippets)
-    Each snippet is the trimmed LINE containing the match (not a wide context window).
     Duplicate lines are deduplicated while preserving order.
     """
     if not text or not keyword:
@@ -170,7 +332,6 @@ def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False
     snippets = []
     seen = set()
     for m in matches:
-        # Expand to the nearest newlines to get the full line
         line_start = text.rfind("\n", 0, m.start())
         line_start = line_start + 1 if line_start != -1 else 0
         line_end = text.find("\n", m.end())
@@ -183,30 +344,116 @@ def search_keyword_in_text(text: str, keyword: str, case_sensitive: bool = False
     return True, len(matches), snippets
 
 
-def _get_alternate_url(url: str) -> str:
-    """Return alternate mirror URL by swapping source <-> source1 host."""
+def _get_alternate_urls(url: str) -> list[str]:
+    """
+    Return all alternate mirror URLs to try when the primary URL fails.
+
+    z2data.com has two known CDN hosts: source.z2data.com and source1.z2data.com.
+    We try both regardless of which was primary.
+
+    Additionally, for old /web/ paths (archived pages from 2017-2019) that often
+    return connection errors, we also try stripping /web/ from the path, which
+    matches the newer URL structure that the servers still serve.
+    Example:
+      source.z2data.com/web/2019/9/11/.../0484584530.html
+      → source.z2data.com/2019/9/11/.../0484584530.html  (alternate path)
+    """
+    alts = []
+    # Mirror swap
     if "//source1.z2data.com" in url:
-        return url.replace("//source1.z2data.com", "//source.z2data.com", 1)
-    if "//source.z2data.com" in url:
-        return url.replace("//source.z2data.com", "//source1.z2data.com", 1)
-    return ""
+        alts.append(url.replace("//source1.z2data.com", "//source.z2data.com", 1))
+    elif "//source.z2data.com" in url:
+        alts.append(url.replace("//source.z2data.com", "//source1.z2data.com", 1))
+
+    # /web/ path stripping — try both hosts
+    if "/web/" in url:
+        stripped = url.replace("/web/", "/", 1)
+        alts.append(stripped)
+        # Also stripped + mirror swap
+        if "//source1.z2data.com" in stripped:
+            alts.append(stripped.replace("//source1.z2data.com", "//source.z2data.com", 1))
+        elif "//source.z2data.com" in stripped:
+            alts.append(stripped.replace("//source.z2data.com", "//source1.z2data.com", 1))
+
+    return alts
+
+
+def _download_with_retry(url: str, session_timeout: int, max_attempts: int = 4) -> tuple[bytes | None, str | None]:
+    """
+    Download URL with app-level exponential back-off retry.
+
+    urllib3-internal retries are DISABLED (Retry(total=0)) so this function
+    has full control over every attempt.  On a connection-level error the
+    thread-local session is discarded and recreated so a poisoned connection
+    pool does not carry over to the next attempt.
+
+    Retry schedule (base 2, ±25% jitter):
+      attempt 1 → immediate
+      attempt 2 → wait ~2 s
+      attempt 3 → wait ~4 s
+      attempt 4 → wait ~8 s
+
+    No-retry statuses: 403, 404, 410  (permanent client errors)
+    Retried statuses:  429, 500, 502, 503, 504  (transient server errors)
+    """
+    last_err = None
+    is_connection_error = False
+
+    try:
+        host = url.split("/")[2]
+    except IndexError:
+        host = url
+
+    for attempt in range(1, max_attempts + 1):
+        # Wait if this host has been detected as blocked/rate-limiting
+        _wait_if_blocked(host)
+        # Enforce minimum inter-request delay (shared across all threads)
+        _rate_limit(url)
+
+        # Refresh session if previous attempt had a connection-level error
+        session = _get_session(fresh=is_connection_error)
+        is_connection_error = False
+
+        try:
+            resp = session.get(
+                url,
+                timeout=(_CONNECT_TIMEOUT, session_timeout),  # (connect, read)
+                stream=False,
+                allow_redirects=True,
+            )
+            if resp.status_code == 200:
+                _record_success(host)
+                return resp.content, None
+
+            last_err = f"HTTP {resp.status_code}"
+            _record_failure(host)
+
+            # No retry on permanent failures
+            if resp.status_code in (403, 404, 410):
+                break
+            # 429 = rate limited: extra pause before next attempt
+            if resp.status_code == 429:
+                time.sleep(5 + random.random() * 5)
+            # 5xx: retryable — fall through to back-off below
+
+        except Exception as e:
+            last_err = str(e)[:200]
+            _record_failure(host)
+            # Connection-level errors (SSL, TCP reset, MaxRetries from pool) —
+            # discard the session so the next attempt opens a fresh socket.
+            is_connection_error = True
+
+        if attempt < max_attempts:
+            # Exponential back-off: 2^attempt seconds ± 25% jitter
+            wait = (2 ** attempt) * (0.75 + 0.5 * random.random())
+            time.sleep(wait)
+
+    return None, last_err
 
 
 def _download_pdf(url: str, session_timeout: int):
-    """
-    Attempt to download URL content.
-    Returns (pdf_bytes, error_msg). On success error_msg is None.
-    """
-    import requests
-    try:
-        resp = requests.get(url, timeout=session_timeout, stream=True)
-        if resp.status_code != 200:
-            return None, f"HTTP {resp.status_code}"
-        return resp.content, None
-    except requests.exceptions.Timeout:
-        return None, "Timeout"
-    except Exception as e:
-        return None, f"Download Error: {str(e)[:80]}"
+    return _download_with_retry(url, session_timeout, max_attempts=4)
+
 
 
 def _build_context_snippet(text: str, keyword: str, context_chars: int = 100) -> str:
@@ -264,10 +511,17 @@ def _build_context_snippet(text: str, keyword: str, context_chars: int = 100) ->
 
 def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeout: int) -> list:
     """
-    Download a PDF from URL and search for keyword.
-    On download failure, retries once with the alternate mirror host.
-    If both attempts fail, the raw error/timeout message is surfaced in
-    URL_Search_Status and Keyword_Search_Status (URL_Status=0).
+    Download content from URL and search for keyword.
+
+    Handles both PDF and HTML URLs:
+      - .html / .htm  → extract text via HTML parser
+      - everything else (or unknown) → try PDF parser, fallback to HTML parser
+
+    Retry strategy:
+      1. Try primary URL with up to 3 attempts + exponential back-off
+      2. If all fail, swap mirror host (source ↔ source1) and retry 3 more times
+      3. Only then report the actual error
+
     Always returns exactly ONE row per URL+Keyword pair.
     """
     base = {
@@ -289,34 +543,65 @@ def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeou
         r.update(overrides)
         return r
 
-    if not url or not str(url).startswith("http"):
-        return [make_row(URL_Status=0, URL_Search_Status="Invalid URL", Keyword_Search_Status="Invalid URL")]
+    url = str(url).strip()
+    if not url or not url.startswith("http"):
+        return [make_row(URL_Status=0, URL_Search_Status="Invalid URL",
+                         Keyword_Search_Status="Invalid URL")]
 
-    # --- Primary download attempt ---
-    pdf_bytes, err = _download_pdf(url, session_timeout)
+    # ── Determine content type from URL extension ────────────────────
+    url_lower = url.lower().split("?")[0]
+    is_html_url = url_lower.endswith(".html") or url_lower.endswith(".htm")
 
-    # --- Retry with alternate mirror on any failure (covers Download Error & Timeout) ---
-    if pdf_bytes is None:
-        alt_url = _get_alternate_url(url)
-        if alt_url:
-            pdf_bytes, err = _download_pdf(alt_url, session_timeout)
+    # ── Download: primary URL first, then all mirror/path alternates ──
+    #
+    # Attempt order:
+    #   1. Primary URL         — 4 attempts with exponential back-off
+    #   2. Mirror swap         — source ↔ source1  (4 attempts)
+    #   3. /web/ path stripped — same URL without /web/ segment (4 attempts)
+    #   4. Stripped + mirror   — stripped URL on the other host (4 attempts)
+    #
+    # Each attempt uses a fresh session after any connection-level error
+    # (see _download_with_retry / _get_session(fresh=True)).
+    content_bytes, err = _download_with_retry(url, session_timeout, max_attempts=4)
 
-    # --- Bug fix: surface the real error message instead of hiding it ---
-    # Both primary and alternate mirror failed: report the actual error
-    if pdf_bytes is None:
-        error_msg = err if err else "Download Error: Unknown"
+    if content_bytes is None:
+        for alt_url in _get_alternate_urls(url):
+            content_bytes, err = _download_with_retry(alt_url, session_timeout, max_attempts=4)
+            if content_bytes is not None:
+                break
+
+    if content_bytes is None:
+        # Surface the full error message so the user knows exactly what failed
+        if err and not err.startswith(("Download Error:", "HTTP ", "Timeout")):
+            error_msg = f"Download Error: {err}"
+        else:
+            error_msg = err or "Download Error: Unknown"
         return [make_row(URL_Status=0, URL_Search_Status=error_msg,
                          Keyword_Search_Status=error_msg)]
 
-    # --- Text extraction ---
-    text, extraction_status = extract_text_from_pdf_bytes(pdf_bytes)
+    # ── Text extraction ───────────────────────────────────────────────
+    if is_html_url:
+        # HTML product pages: parse directly as HTML
+        text, extraction_status = _extract_text_from_html_bytes(content_bytes)
+        if not text and "error:" not in extraction_status:
+            # Could be a PDF served with .html extension — try PDF parser too
+            text2, status2 = extract_text_from_pdf_bytes(content_bytes)
+            if text2:
+                text, extraction_status = text2, status2
+    else:
+        # Try PDF first
+        text, extraction_status = extract_text_from_pdf_bytes(content_bytes)
+        if "error:" in extraction_status:
+            # Could be HTML served with .pdf extension or wrong content-type
+            text2, status2 = _extract_text_from_html_bytes(content_bytes)
+            if text2:
+                text, extraction_status = text2, status2
 
     if "error:" in extraction_status:
         return [make_row(URL_Status=0, URL_Search_Status="PDF Not mirrored / Corrupted",
                          Keyword_Search_Status="PDF Not mirrored / Corrupted")]
 
     if extraction_status == "scanned":
-        # Bug fix: scanned PDFs use URL_Status=3 / URL_Search_Status="Done" (not 4/error)
         msg = (
             "PDF is Non searchable,"
             "Advanced Scanned Extraction can make the PDF searchable."
@@ -324,12 +609,10 @@ def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeou
         return [make_row(URL_Status=3, URL_Search_Status="Done",
                          Keyword_Search_Status=msg, Keyword_Status=None)]
 
-    # --- Keyword search on searchable PDF ---
+    # ── Keyword search ────────────────────────────────────────────────
     found, count, snippets = search_keyword_in_text(text, keyword, case_sensitive)
 
     if found:
-        # Bug fix: one row per URL+Keyword pair with a ~100-char context window
-        # around the first match (matching Check_System feature_value format)
         context_snippet = _build_context_snippet(text, keyword, context_chars=100)
         return [make_row(
             URL_Status=3,
@@ -431,7 +714,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🔧 Search Options")
 
-    workers = st.slider("Concurrent Workers", 4, 40, CONCURRENT_DOWNLOADS, 2,
+    workers = st.slider("Concurrent Workers", 2, 20, CONCURRENT_DOWNLOADS, 1,
                         help="More workers = faster, but uses more memory")
     timeout = st.slider("Per-URL Timeout (sec)", 5, 60, TIMEOUT_SECONDS, 5)
     case_sensitive = st.checkbox("Case-Sensitive Search", value=False)
@@ -547,8 +830,39 @@ with tab_search:
                     metrics_area = st.empty()
 
                     results = []
+                    failed_rows = []   # rows whose first pass returned an error — retried in second pass
                     completed = 0
                     log_lines = []
+
+                    # ── helper: build output DataFrame from raw result dicts ──
+                    _OUT_COLS = [
+                        "URL", "Keyword", "Extraction Option",
+                        "URL_Status", "URL_Search_Status",
+                        "Keyword_Status", "feature_name",
+                        "feature_value", "Keyword_Search_Status",
+                    ]
+
+                    def _build_df(result_dicts):
+                        df_tmp = pd.DataFrame(result_dicts)
+                        df_tmp.rename(columns={"Extraction_Option": "Extraction Option"}, inplace=True)
+                        for c in _OUT_COLS:
+                            if c not in df_tmp.columns:
+                                df_tmp[c] = None
+                        return df_tmp[_OUT_COLS]
+
+                    def _save_progress(result_dicts):
+                        """Persist partial results to session state so they survive a Stop."""
+                        if result_dicts:
+                            st.session_state.results_df = _build_df(result_dicts)
+
+                    def _is_error(row_dict: dict) -> bool:
+                        status = str(row_dict.get("Keyword_Search_Status", ""))
+                        return (
+                            "Download Error" in status
+                            or "Timeout" in status
+                            or "HTTP " in status
+                            or status == "Download Error: Unknown"
+                        )
 
                     start_time = time.time()
 
@@ -558,79 +872,128 @@ with tab_search:
                         if len(log_lines) > 80:
                             log_lines.pop(0)
 
-                    log(f"Starting search for {total:,} URLs with {workers} workers…")
+                    def _run_pass(work_rows, pass_label, extra_delay=0):
+                        """
+                        Submit work_rows to the thread pool.
+                        Returns (all_result_dicts, error_input_rows).
+                        extra_delay: seconds to wait between submissions (second pass = slower).
+                        """
+                        nonlocal completed
+                        pass_results = []
+                        pass_errors = []
 
-                    with ThreadPoolExecutor(max_workers=workers) as executor:
-                        futures = {
-                            executor.submit(
-                                process_one_url,
-                                str(row.get("URL", "")),
-                                str(row.get("Keyword", "")),
-                                case_sensitive,
-                                timeout,
-                            ): row
-                            for row in rows
-                        }
+                        with ThreadPoolExecutor(max_workers=workers) as executor:
+                            future_map = {}
+                            for r in work_rows:
+                                if extra_delay > 0:
+                                    time.sleep(extra_delay)
+                                f = executor.submit(
+                                    process_one_url,
+                                    str(r.get("URL", "")),
+                                    str(r.get("Keyword", "")),
+                                    case_sensitive,
+                                    timeout,
+                                )
+                                future_map[f] = r
 
-                        for future in as_completed(futures):
-                            if not st.session_state.running:
-                                log("⏹ Stopped by user.")
-                                executor.shutdown(wait=False, cancel_futures=True)
-                                break
+                            for future in as_completed(future_map):
+                                if not st.session_state.running:
+                                    log("⏹ Stopped by user.")
+                                    executor.shutdown(wait=False, cancel_futures=True)
+                                    break
 
-                            try:
-                                rows = future.result()
-                                results.extend(rows)
+                                try:
+                                    res_rows = future.result()
+                                except Exception as e:
+                                    res_rows = [{
+                                        "URL": str(future_map[future].get("URL", "")),
+                                        "Keyword": str(future_map[future].get("Keyword", "")),
+                                        "Extraction_Option": "",
+                                        "URL_Status": 0,
+                                        "URL_Search_Status": f"Exception: {e}",
+                                        "Keyword_Status": None,
+                                        "feature_name": str(future_map[future].get("Keyword", "")),
+                                        "feature_value": None,
+                                        "Keyword_Search_Status": f"Exception: {e}",
+                                        "match_count": 0,
+                                        "context": "",
+                                    }]
+
                                 completed += 1
-
-                                # Use first row for status logging
-                                res = rows[0]
+                                res = res_rows[0]
                                 status = res["Keyword_Search_Status"]
                                 url_short = res["URL"][-50:] if len(res["URL"]) > 50 else res["URL"]
-                                log(f"[{completed}/{total}] {status:12s} → …{url_short}")
+                                log(f"[{pass_label}][{completed}/{total}] {status[:14]:14s} → …{url_short}")
 
-                            except Exception as e:
-                                completed += 1
-                                log(f"[{completed}/{total}] EXCEPTION: {e}")
+                                pass_results.extend(res_rows)
+                                if _is_error(res):
+                                    pass_errors.append(future_map[future])
 
-                            # Update UI every N records
-                            if completed % max(1, min(20, total // 50)) == 0 or completed == total:
-                                pct = completed / total
-                                elapsed = time.time() - start_time
-                                rate = completed / elapsed if elapsed > 0 else 0
-                                eta_sec = (total - completed) / rate if rate > 0 else 0
+                                # Save progress every 100 completed rows
+                                if completed % 100 == 0:
+                                    _save_progress(results + pass_results)
+                                    log(f"💾 Progress saved — {completed:,} rows")
 
-                                prog_bar.progress(pct, text=f"Processing {completed:,}/{total:,}  •  {rate:.1f} URLs/sec  •  ETA {eta_sec:.0f}s")
-                                status_text.markdown(
-                                    f"⏱ **Elapsed:** {elapsed:.1f}s  |  "
-                                    f"**Speed:** {rate:.1f} URLs/s  |  "
-                                    f"**Done:** {completed:,}/{total:,}"
-                                )
+                                # Update UI every N records
+                                _n = max(1, min(20, total // 50))
+                                if completed % _n == 0 or completed == total:
+                                    pct = min(completed / total, 1.0)
+                                    elapsed = time.time() - start_time
+                                    rate = completed / elapsed if elapsed > 0 else 0
+                                    eta_sec = (total - completed) / rate if rate > 0 else 0
+                                    prog_bar.progress(pct, text=f"[{pass_label}] {completed:,}/{total:,}  •  {rate:.1f} URLs/sec  •  ETA {eta_sec:.0f}s")
+                                    status_text.markdown(
+                                        f"⏱ **Elapsed:** {elapsed:.1f}s  |  "
+                                        f"**Speed:** {rate:.1f} URLs/s  |  "
+                                        f"**Done:** {completed:,}/{total:,}"
+                                    )
+                                    log_area.markdown(
+                                        f'<div class="progress-box">' +
+                                        "<br>".join(log_lines[-30:]) +
+                                        "</div>",
+                                        unsafe_allow_html=True,
+                                    )
 
-                                # Live log
-                                log_area.markdown(
-                                    f'<div class="progress-box">' +
-                                    "<br>".join(log_lines[-30:]) +
-                                    "</div>",
-                                    unsafe_allow_html=True,
-                                )
+                        return pass_results, pass_errors
+
+                    # ════════════════════════════════════════════
+                    # PASS 1 — process all URLs
+                    # ════════════════════════════════════════════
+                    log(f"🚀 Pass 1 — {total:,} URLs, {workers} workers…")
+                    pass1_results, pass1_errors = _run_pass(rows, "Pass1")
+                    results.extend(pass1_results)
+
+                    # ════════════════════════════════════════════
+                    # PASS 2 — retry only the failed ones
+                    # ════════════════════════════════════════════
+                    if pass1_errors and st.session_state.running:
+                        log(f"♻️  Pass 2 — retrying {len(pass1_errors):,} failed URLs (slower, more delay)…")
+                        # Remove first-pass error rows from results; replace with pass-2 outcomes
+                        error_keys = {(r.get("URL",""), r.get("Keyword","")) for r in pass1_errors}
+                        results = [r for r in results
+                                   if (r.get("URL",""), r.get("Keyword","")) not in error_keys]
+                        total += len(pass1_errors)  # extend progress bar denominator
+
+                        # Cool-down before second pass: let the server recover
+                        log("⏳ Waiting 15 s before second pass…")
+                        time.sleep(15)
+
+                        pass2_results, still_failed = _run_pass(
+                            pass1_errors, "Pass2",
+                            extra_delay=1.0,  # 1 s stagger between submissions
+                        )
+                        results.extend(pass2_results)
+
+                        if still_failed:
+                            log(f"⚠️  {len(still_failed):,} URLs could not be reached after 2 passes.")
+                        else:
+                            log("✅ All previously failed URLs resolved in Pass 2!")
 
                     st.session_state.running = False
 
-                    # Build results DataFrame
+                    # Final save
                     if results:
-                        out_cols = [
-                            "URL", "Keyword", "Extraction_Option",
-                            "URL_Status", "URL_Search_Status",
-                            "Keyword_Status", "feature_name",
-                            "feature_value", "Keyword_Search_Status",
-                        ]
-                        results_df = pd.DataFrame(results)
-                        # Rename to match expected output
-                        results_df.rename(columns={"Extraction_Option": "Extraction Option"}, inplace=True)
-                        out_cols[2] = "Extraction Option"
-                        st.session_state.results_df = results_df[out_cols]
-
+                        _save_progress(results)
                         elapsed_total = time.time() - start_time
                         prog_bar.progress(1.0, text="✅ Search Complete!")
                         st.success(
