@@ -211,21 +211,55 @@ def _download_pdf(url: str, session_timeout: int):
 
 def _build_context_snippet(text: str, keyword: str, context_chars: int = 100) -> str:
     """
-    Build a context snippet around the first occurrence of keyword in text.
-    Returns '…<up-to context_chars chars before>keyword<up-to context_chars chars after>…'
-    matching the Check_System format.
+    Build a context snippet around keyword occurrences in text.
+
+    Strategy: collect a context window around EVERY match, deduplicate them,
+    then return the one with the most surrounding text (richest context).
+    This prevents the feature_value from containing duplicate snippets when
+    the same barcode appears multiple times in the PDF (e.g. TOC + product page).
+
+    Format: '…<up-to context_chars chars before match>…<match>…<up-to context_chars after>…'
     """
     if not text or not keyword:
         return ""
-    idx = text.lower().find(str(keyword).lower())
-    if idx == -1:
+
+    kw_lower = str(keyword).lower()
+    kw_len = len(kw_lower)
+    text_lower = text.lower()
+
+    # Collect all match positions
+    positions = []
+    start = 0
+    while True:
+        idx = text_lower.find(kw_lower, start)
+        if idx == -1:
+            break
+        positions.append(idx)
+        start = idx + 1  # allow overlapping scan
+
+    if not positions:
         return ""
-    start = max(0, idx - context_chars)
-    end = min(len(text), idx + len(str(keyword)) + context_chars)
-    snippet = text[start:end].strip()
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if end < len(text) else ""
-    return f"{prefix}{snippet}{suffix}"
+
+    # Build unique context windows, keep the richest (most non-whitespace chars)
+    seen_snippets: set[str] = set()
+    best = ""
+    for idx in positions:
+        s = max(0, idx - context_chars)
+        e = min(len(text), idx + kw_len + context_chars)
+        raw = text[s:e].strip()
+        # Sanitise control chars so the snippet is always xlsx-safe too
+        raw = _ILLEGAL_CHARS_RE.sub("", raw)
+        if not raw or raw in seen_snippets:
+            continue
+        seen_snippets.add(raw)
+        prefix = "…" if s > 0 else ""
+        suffix = "…" if e < len(text) else ""
+        candidate = f"{prefix}{raw}{suffix}"
+        # Prefer the snippet with the most surrounding context (richest information)
+        if len(raw) > len(best.replace("…", "")):
+            best = candidate
+
+    return best
 
 
 def process_one_url(url: str, keyword: str, case_sensitive: bool, session_timeout: int) -> list:
@@ -341,10 +375,25 @@ def render_stat_cards(total, found, not_found, scanned, errors):
             """, unsafe_allow_html=True)
 
 
+_ILLEGAL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize_cell(val):
+    """Strip control chars that openpyxl cannot write to xlsx cells.
+    PDFs often embed NUL (\x00), form-feed (\x0c), vertical-tab (\x0b),
+    ESC (\x1b) etc. which are valid Python strings but crash openpyxl."""
+    if isinstance(val, str):
+        return _ILLEGAL_CHARS_RE.sub("", val)
+    return val
+
+
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    # Sanitise every cell before handing to openpyxl
+    _map_fn = getattr(df, "map", None) or df.applymap   # pandas >= 2.1 renamed applymap -> map
+    clean = _map_fn(_sanitize_cell)
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
+        clean.to_excel(writer, index=False, sheet_name="Results")
     return output.getvalue()
 
 
@@ -657,15 +706,18 @@ with tab_results:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         with col_dl1:
-            xlsx_bytes = df_to_excel_bytes(filtered)
-            st.download_button(
-                "📥 Download Excel (.xlsx)",
-                data=xlsx_bytes,
-                file_name=f"keyword_search_results_{timestamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
-            )
+            try:
+                xlsx_bytes = df_to_excel_bytes(filtered)
+                st.download_button(
+                    "📥 Download Excel (.xlsx)",
+                    data=xlsx_bytes,
+                    file_name=f"keyword_search_results_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                )
+            except Exception as exc:
+                st.error(f"Excel export failed: {exc}. Use CSV instead.")
 
         with col_dl2:
             csv_bytes = df_to_csv_bytes(filtered)
