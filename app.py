@@ -831,7 +831,7 @@ with tab_search:
 
                     results = []
                     failed_rows = []   # rows whose first pass returned an error — retried in second pass
-                    completed = 0
+                    completed = [0]    # mutable counter — lets _run_pass increment without nonlocal
                     log_lines = []
 
                     # ── helper: build output DataFrame from raw result dicts ──
@@ -877,8 +877,8 @@ with tab_search:
                         Submit work_rows to the thread pool.
                         Returns (all_result_dicts, error_input_rows).
                         extra_delay: seconds to wait between submissions (second pass = slower).
+                        completed is a list[int] so we can mutate it without nonlocal.
                         """
-                        nonlocal completed
                         pass_results = []
                         pass_errors = []
 
@@ -919,33 +919,33 @@ with tab_search:
                                         "context": "",
                                     }]
 
-                                completed += 1
+                                completed[0] += 1
                                 res = res_rows[0]
                                 status = res["Keyword_Search_Status"]
                                 url_short = res["URL"][-50:] if len(res["URL"]) > 50 else res["URL"]
-                                log(f"[{pass_label}][{completed}/{total}] {status[:14]:14s} → …{url_short}")
+                                log(f"[{pass_label}][{completed[0]}/{total}] {status[:14]:14s} → …{url_short}")
 
                                 pass_results.extend(res_rows)
                                 if _is_error(res):
                                     pass_errors.append(future_map[future])
 
                                 # Save progress every 100 completed rows
-                                if completed % 100 == 0:
+                                if completed[0] % 100 == 0:
                                     _save_progress(results + pass_results)
-                                    log(f"💾 Progress saved — {completed:,} rows")
+                                    log(f"💾 Progress saved — {completed[0]:,} rows")
 
                                 # Update UI every N records
                                 _n = max(1, min(20, total // 50))
-                                if completed % _n == 0 or completed == total:
-                                    pct = min(completed / total, 1.0)
+                                if completed[0] % _n == 0 or completed[0] == total:
+                                    pct = min(completed[0] / total, 1.0)
                                     elapsed = time.time() - start_time
-                                    rate = completed / elapsed if elapsed > 0 else 0
-                                    eta_sec = (total - completed) / rate if rate > 0 else 0
-                                    prog_bar.progress(pct, text=f"[{pass_label}] {completed:,}/{total:,}  •  {rate:.1f} URLs/sec  •  ETA {eta_sec:.0f}s")
+                                    rate = completed[0] / elapsed if elapsed > 0 else 0
+                                    eta_sec = (total - completed[0]) / rate if rate > 0 else 0
+                                    prog_bar.progress(pct, text=f"[{pass_label}] {completed[0]:,}/{total:,}  •  {rate:.1f} URLs/sec  •  ETA {eta_sec:.0f}s")
                                     status_text.markdown(
                                         f"⏱ **Elapsed:** {elapsed:.1f}s  |  "
                                         f"**Speed:** {rate:.1f} URLs/s  |  "
-                                        f"**Done:** {completed:,}/{total:,}"
+                                        f"**Done:** {completed[0]:,}/{total:,}"
                                     )
                                     log_area.markdown(
                                         f'<div class="progress-box">' +
@@ -997,8 +997,8 @@ with tab_search:
                         elapsed_total = time.time() - start_time
                         prog_bar.progress(1.0, text="✅ Search Complete!")
                         st.success(
-                            f"✅ Finished **{completed:,}** URLs in **{elapsed_total:.1f}s** "
-                            f"({completed/elapsed_total:.1f} URLs/sec)"
+                            f"✅ Finished **{completed[0]:,}** URLs in **{elapsed_total:.1f}s** "
+                            f"({completed[0]/elapsed_total:.1f} URLs/sec)"
                         )
                     else:
                         st.warning("No results collected.")
