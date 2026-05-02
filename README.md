@@ -8,7 +8,7 @@
 
 ---
 
-## ✅ What's New in v4.0
+## ✅ What's New
 
 | Feature | Description |
 |---------|-------------|
