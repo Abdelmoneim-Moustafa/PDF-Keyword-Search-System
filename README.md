@@ -1,4 +1,4 @@
-# 🔍 PDF Keyword Search System — v4.0
+# 🔍 PDF Keyword Search System 
 
 > **Single • Multi • Table Search Engine**
 >
@@ -17,7 +17,6 @@
 | 🔢 **Full Occurrence Count** | Counts every match in the document, not just the first |
 | 📋 **3 Templates in One File** | Single Search / Multi Search / Table Search — clear sheet names |
 | 💾 **Job State + Autosave** | Saves progress CSV + JSON state file every 100 rows |
-| ⚠️ **No "HTS" in UI** | All public-facing labels use simple names only |
 | 🔧 **7 Bug Fixes** | Row dedup, state reset, wired controls, Extraction Option, retry efficiency, content validation, HTML not-found detection |
 
 ---
