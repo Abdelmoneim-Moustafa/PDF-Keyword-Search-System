@@ -1,33 +1,45 @@
-# 🔍 PDF Keyword Search — Streamlit App
+# 🔍 PDF Keyword Search System — v4.0
 
-A fast, concurrent PDF & HTML keyword search tool that processes thousands of URLs and reports whether a keyword was found, with automatic retry on failure and smart rate limiting.
-
----
-
-## ✅ Features
-
-- Upload Excel / CSV with `URL` + `Keyword` columns
-- Supports **PDF** and **HTML** page URLs
-- Concurrent multi-threaded downloading (up to 20 workers)
-- Searches text-based PDFs using PyMuPDF
-- Searches HTML product pages using built-in HTML parser
-- Detects scanned / image-only PDFs
-- **Automatic second-pass retry** for any failed URLs
-- **Smart rate limiter** — prevents server bans (250 ms min gap between requests)
-- **Blocked-server detection** — auto-pauses 30 s when a host fails 5× in a row
-- **Saves progress every 100 rows** — partial results survive a Stop
-- Mirror fallback: tries `source.z2data.com` ↔ `source1.z2data.com` automatically
-- Live progress bar + speed metrics + live log
-- Filter, view, and download results as Excel or CSV
-- **Limit: 50,000 URLs per run**
+> **Single • Multi • Table Search Engine**
+>
+> Fast, concurrent keyword search across PDF and HTML URLs —
+> with clean user-facing output, full occurrence counting,
+> smart retry, disk-backed autosave, and full error isolation.
 
 ---
 
-## 📂 Project Structure
+## ✅ What's New in v4.0
+
+| Feature | Description |
+|---------|-------------|
+| 🧹 **Clean Output File** | Main result column shows only Found / Not Found / Partial Match / Non searchable. Technical errors go to the Notes column only. |
+| 📊 **4 Excel Sheets** | All Results · Found · Not Found and Partial · Errors and Issues |
+| 🔢 **Full Occurrence Count** | Counts every match in the document, not just the first |
+| 📋 **3 Templates in One File** | Single Search / Multi Search / Table Search — clear sheet names |
+| 💾 **Job State + Autosave** | Saves progress CSV + JSON state file every 100 rows |
+| ⚠️ **No "HTS" in UI** | All public-facing labels use simple names only |
+| 🔧 **7 Bug Fixes** | Row dedup, state reset, wired controls, Extraction Option, retry efficiency, content validation, HTML not-found detection |
+
+---
+
+## ⚠️ Current Limitation
+
+This version runs on **Streamlit**, which means:
+- Processing happens in the browser session — not a true background server job
+- If Streamlit Cloud restarts the app container, the in-memory job stops
+
+**The autosave system (CSV + JSON on disk) mitigates most practical issues** — the sidebar
+Recovery panel lets you download or restore partial results at any time.
+
+For a fully persistent system that survives disconnection, see [Production Architecture](#production-architecture) below.
+
+---
+
+## 🗂️ Project Structure
 
 ```
 pdf-keyword-search-system/
-├── app.py               ← Main Streamlit application
+├── app.py               ← Main Streamlit application (v4.0)
 ├── requirements.txt     ← Python dependencies
 └── README.md            ← This file
 ```
@@ -36,140 +48,222 @@ pdf-keyword-search-system/
 
 ## 🚀 Setup & Run
 
-### 1. Install Python (3.10+)
+### Requirements
 
-The app uses Python 3.10+ union type syntax (`X | Y`). Make sure your Python version is at least 3.10:
+- **Python 3.10+** (uses `X | Y` union type syntax)
+- Internet access
 
-```bash
-python --version
-```
-
-### 2. Create a virtual environment (recommended)
+### Install & Run
 
 ```bash
+git clone https://github.com/YOUR_USERNAME/pdf-keyword-search-system.git
+cd pdf-keyword-search-system
+
 python -m venv venv
+source venv/bin/activate    # Windows: venv\Scripts\activate
 
-# Windows:
-venv\Scripts\activate
-
-# Mac/Linux:
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
-
-### 4. Run the app
-
-```bash
 streamlit run app.py
 ```
 
-The app will open in your browser at `http://localhost:8501`
+Opens at `http://localhost:8501`
 
 ---
 
-## ☁️ Deploy to GitHub + Streamlit Cloud
+## ☁️ Deploy on Streamlit Cloud
 
-### Step 1 — Push to GitHub
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: PDF Keyword Search app"
-git remote add origin https://github.com/YOUR_USERNAME/pdf-keyword-search.git
-git push -u origin main
-```
-
-### Step 2 — Deploy on Streamlit Cloud
-
-1. Go to [share.streamlit.io](https://share.streamlit.io)
-2. Click **New app**
-3. Select your GitHub repo
-4. Set **Main file path** to `app.py`
-5. Click **Deploy**
+1. Push repo to GitHub
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
+3. Select repo, set **Main file** = `app.py`
+4. Click **Deploy**
 
 ---
 
-## 📋 Input File Format
+## 📋 Input Format
 
-Your Excel (`.xlsx`) or CSV must have exactly these two columns:
+Upload Excel (`.xlsx`) or CSV with two columns:
 
 | URL | Keyword |
 |-----|---------|
-| https://example.com/document.pdf | 51712160148 |
-| https://example.com/product.html | 4015081636822 |
+| `https://source.z2data.com/…/file.pdf` | `51712160148` |
+| `https://source.z2data.com/…/page.html` | `EAN123\|UPC456` |
+| `https://source.z2data.com/…/doc.pdf` | `8471.30\|8471.41\|8471.49` |
 
-> **Note:** Both PDF and HTML URLs are supported. The app auto-detects the content type.
+Download the template from the sidebar before filling your data.
+The template file contains three sheets: **Single Search**, **Multi Search**, **Table Search**.
 
 ---
 
-## 📤 Output Columns
+## 🔘 Search Modes
+
+| Mode | Keyword Format | Logic |
+|------|---------------|-------|
+| **Single Search** | `51712160148` | Found or Not Found |
+| **Multi Search** | `EAN\|UPC\|GTIN` | ANY: Found if ≥1 match · ALL: Partial if some match |
+| **Table Search** | `8471.30\|8471.41` | Same as Multi, optimized for numeric codes |
+| **Auto Detect** | Any | `\|` → Multi; numeric → Table; else → Single |
+
+---
+
+## 🚦 Output: Result Values
+
+| Result | Meaning |
+|--------|---------|
+| ✅ **Found** | Keyword located in the document |
+| ❌ **Not Found** | Document searchable, keyword absent |
+| ⚠️ **Partial Match** | Multi + Match ALL: some keywords found |
+| 🟡 **Non searchable** | Image/scanned PDF — no text layer |
+
+> Technical issues (SSL errors, timeouts, connection failures) appear only in the **Notes** column.
+> The **Result** column always contains one of the four values above — clean for non-technical users.
+
+---
+
+## 📤 Output File Columns
 
 | Column | Description |
 |--------|-------------|
 | `URL` | Original URL |
-| `Keyword` | Keyword searched |
-| `Extraction Option` | Extraction method used |
-| `URL_Status` | `0` = failed, `3` = processed successfully |
-| `URL_Search_Status` | `"Done"` if processed, error message if failed |
-| `Keyword_Status` | `3.0` if keyword was checked, `None` if not reached |
-| `feature_name` | The keyword searched |
-| `feature_value` | Matched context snippet (~100 chars around first match) |
-| `Keyword_Search_Status` | **Main result** — see values below |
+| `Keyword` | Keyword(s) as entered |
+| `Search Mode` | Single / Multi / Table / Auto |
+| `Result` | **Main result** — one of the four values above |
+| `Match Count` | Total occurrences found in the full document |
+| `Snippet` | ~100-char context window around the first match |
+| `Matched Keywords` | Which keywords were found (Multi mode) |
+| `Missing Keywords` | Which keywords were not found (Multi mode) |
+| `Notes` | Technical detail for errors — empty for normal results |
 
-### Keyword_Search_Status Values
+### Excel Output Sheets
 
-| Value | Meaning |
-|-------|---------|
-| `Found` | Keyword found in the document |
-| `Not Found` | Document searchable, keyword absent |
-| `PDF is Non searchable, Advanced Scanned Extraction can make the PDF searchable.` | Image/scanned PDF — no text layer |
-| `PDF Not mirrored / Corrupted` | File is unreadable or corrupted |
-| `Download Error: …` | Network or connection failure (surfaced after both passes fail) |
-| `HTTP 404`, `HTTP 403`, etc. | Permanent server errors — not retried |
-| `Timeout` | Server did not respond within the timeout setting |
+| Sheet | Contents |
+|-------|----------|
+| **All Results** | Every row in the run |
+| **Found** | Rows where Result = Found |
+| **Not Found and Partial** | Rows where Result = Not Found, Partial Match, or Non searchable |
+| **Errors and Issues** | Rows with a non-empty Notes column |
 
 ---
 
-## ⚙️ Settings (Sidebar)
+## ⚙️ Settings Reference
 
-| Setting | Default | Range | Description |
-|---------|---------|-------|-------------|
-| Concurrent Workers | **6** | 2 – 20 | Parallel downloads. Keep low (4–8) for z2data.com to avoid rate limits |
-| Per-URL Timeout | 20 s | 5 – 60 s | Max seconds to wait for a response per URL |
-| Case-Sensitive Search | Off | On / Off | Toggle exact-case keyword matching |
-| Output Format | Excel | Excel / CSV | Download format for results |
-
-> **Tip:** If you see many Download Errors, reduce Workers to 4 and increase Timeout to 30 s.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| **Concurrent Workers** | 6 | Parallel downloads — keep 4–6 for z2data.com |
+| **Timeout per URL** | 20s | Max wait — increase for large/slow PDFs |
+| **Case-Sensitive** | OFF | OFF: `EAN123` matches `ean123` |
+| **Enable Retry System** | ON | Automatically retries failed URLs in Pass 2 |
+| **Enable Mirror Fallback** | ON | Tries `source1.z2data.com` if `source.z2data.com` fails |
+| **Enable Smart Error Detection** | ON | Detects HTML "not found" pages returned as 200 OK |
 
 ---
 
-## 🔄 Retry Logic
-
-The app uses a **two-pass retry system** to minimise errors:
+## 🔄 Retry & Fallback
 
 | Pass | What happens |
 |------|-------------|
-| **Pass 1** | All URLs processed with up to 4 attempts each + exponential back-off |
-| **Mirror fallback** | On failure, automatically swaps `source.z2data.com` ↔ `source1.z2data.com` |
-| **Path fallback** | For old `/web/` URLs, also tries the path without `/web/` |
-| **15 s cooldown** | Waits 15 seconds before starting Pass 2 |
-| **Pass 2** | Only the failed URLs are retried, with 1 s stagger between submissions |
+| **Pass 1** | All URLs — 3 attempts + exponential back-off |
+| **Mirror swap** | `source.z2data.com` ↔ `source1.z2data.com` (automatic) |
+| **Path strip** | `/web/` paths tried without `/web/` segment |
+| **15s cooldown** | Waits before Pass 2 |
+| **Pass 2** | Failed rows only — successful rows never re-processed |
 
 ---
 
-## 🛡 Rate Limiting & Block Detection
+## 💾 Auto-Save / Recovery
 
-| Feature | Behaviour |
-|---------|-----------|
-| **Inter-request delay** | Minimum 250 ms between requests to the same host (shared across all workers) |
-| **429 handler** | Extra 5–10 s pause when the server returns HTTP 429 (Too Many Requests) |
-| **Block detector** | After 5 consecutive failures on one host, all workers pause 30 s automatically |
-| **Session refresh** | A fresh TCP connection is opened after any connection-level error |
+- Progress saved to disk every **100 rows** (CSV + JSON job state)
+- Sidebar **Auto-Save / Recovery** panel: download CSV/Excel or restore to Results tab
+- Partial results survive: page refresh, internet drop, accidental Stop
+- Click **Clear** after downloading to remove saved files
+
+---
+
+## 🐛 Bug Fixes (v3 → v4)
+
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | Retry dropped valid duplicate rows | Row IDs assigned per input row; retry tracks by ID not (URL, Keyword) |
+| 2 | Rate-limiter delays carried over between runs | `_last_req.clear()` added to `_clear_all_state()` |
+| 3 | enable_mirror / enable_smart / output_format had no effect | All three now wired into processing and download logic |
+| 4 | Extraction Option column always empty | Set to "PDF" or "HTML" immediately after URL type detection |
+| 5 | Pass 2 submission stagger killed parallel efficiency | Stagger removed; back-off stays inside download loop |
+| 6 | Responses < 64 bytes marked corrupted incorrectly | Now checks PDF/HTML content signature before rejecting |
+| 7 | HTML not-found detection skipped pages > 2000 chars | Now checks first 1000 chars of any page + expanded phrase list |
+
+---
+
+## 🏗 Production Architecture
+
+For a fully server-side system where jobs survive disconnection, the recommended architecture is:
+
+```
+┌─────────────────────────────────────────────────┐
+│  Frontend  (React / Next.js)                    │
+│  • Upload file                                  │
+│  • Poll job progress                            │
+│  • Download result file                         │
+└──────────────────┬──────────────────────────────┘
+                   │ HTTP
+┌──────────────────▼──────────────────────────────┐
+│  Backend API  (FastAPI + Python 3.10+)          │
+│  POST /api/jobs/upload                          │
+│  GET  /api/jobs/{id}          (status + %)      │
+│  GET  /api/jobs/{id}/download (result file)     │
+│  POST /api/jobs/{id}/retry    (re-run failures) │
+│  POST /api/jobs/{id}/cancel                     │
+└──────────────────┬──────────────────────────────┘
+                   │ Enqueue
+┌──────────────────▼──────────────────────────────┐
+│  Queue Broker  (Redis / RabbitMQ)               │
+└──────────────────┬──────────────────────────────┘
+                   │ Consume
+┌──────────────────▼──────────────────────────────┐
+│  Background Worker  (Celery / RQ)               │
+│  • Download URLs concurrently                   │
+│  • Extract PDF / HTML text                      │
+│  • Search keywords (full occurrence count)      │
+│  • Cache repeated URLs                          │
+│  • Autosave every 100 rows to DB                │
+│  • Retry failed rows                            │
+│  • Write final result file to storage           │
+└──────────────────┬──────────────────────────────┘
+         ┌─────────┴──────────┐
+         ▼                    ▼
+┌────────────────┐   ┌────────────────────────┐
+│  PostgreSQL    │   │  S3-compatible Storage │
+│  • jobs        │   │  • uploaded files      │
+│  • job_rows    │   │  • autosave CSV        │
+│  • job_logs    │   │  • result files        │
+│  • url_cache   │   └────────────────────────┘
+└────────────────┘
+```
+
+### Recommended Stack
+
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React or Next.js |
+| Backend API | FastAPI (Python 3.10+) |
+| Worker | Celery + Redis |
+| Database | PostgreSQL |
+| File Storage | S3-compatible |
+| Deployment | Docker on cloud VPS |
+
+### Database Schema (key tables)
+
+**jobs**: id, status, search_mode, total_rows, processed_rows, created_at, finished_at
+
+**job_rows**: id, job_id, row_index, url, keyword, result, match_count, snippet, notes, retry_count
+
+**job_logs**: id, job_id, log_level, message, created_at
+
+**cached_documents**: normalized_url, extracted_text_path, extraction_type, created_at
+
+### MVP Build Order
+
+1. **Phase 1**: Upload → background job → download result (basic pipeline)
+2. **Phase 2**: URL caching, retry system, autosave checkpoints
+3. **Phase 3**: User accounts, job history, admin dashboard, usage analytics
 
 ---
 
@@ -184,6 +278,4 @@ requests>=2.31.0
 urllib3>=2.0.0
 ```
 
-- **Python 3.10+** required (uses union type syntax `X | Y`)
-- Internet access (to download PDFs and HTML pages)
-- At least 2 GB RAM for large batches (10,000+ URLs)
+**Python 3.10+** required.
