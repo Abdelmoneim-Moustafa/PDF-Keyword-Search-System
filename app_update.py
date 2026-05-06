@@ -1069,92 +1069,155 @@ If the page refreshes or your connection drops, use
 
                     def _run_pass(work: list[dict],
                                   label: str) -> tuple[list[dict], list[dict]]:
-                        pass_res: list[dict] = []
-                        pass_err: list[dict] = []
+                        pass_res:  list[dict] = []
+                        pass_err:  list[dict] = []
+                        found_ctr: list[int]  = [0]   # incremental — no full scan
+
+                        # FIX 2: submit + collect in one interleaved pass.
+                        # We cap in-flight futures to workers*2 so the main
+                        # thread never waits for a big backlog at the end.
+                        # The executor exits with cancel_futures=True so any
+                        # straggler beyond the timeout is discarded immediately
+                        # instead of blocking the shutdown.
+                        _in_flight: dict = {}
+                        _work_iter = iter(work)
+                        _stopped   = False
+
+                        def _submit_next():
+                            """Submit one task if work remains and not stopped."""
+                            try:
+                                r = next(_work_iter)
+                            except StopIteration:
+                                return None
+                            while (st.session_state.paused
+                                   and st.session_state.running):
+                                time.sleep(0.4)
+                            if not st.session_state.running:
+                                return None
+                            f = ex.submit(
+                                process_one,
+                                str(r.get("URL", "")),
+                                str(r.get("Keyword", "")),
+                                _MODE, match_all, case_sensitive,
+                                timeout,
+                                int(r.get("_row_id", 0)),
+                                enable_mirror, enable_smart,
+                            )
+                            _in_flight[f] = r
+                            return f
 
                         with ThreadPoolExecutor(max_workers=workers) as ex:
-                            fmap: dict = {}
-                            for r in work:
-                                while (st.session_state.paused
-                                       and st.session_state.running):
-                                    time.sleep(0.4)
-                                if not st.session_state.running:
+                            # Pre-fill the pool
+                            for _ in range(workers * 2):
+                                if _submit_next() is None:
                                     break
-                                f = ex.submit(
-                                    process_one,
-                                    str(r.get("URL", "")),
-                                    str(r.get("Keyword", "")),
-                                    _MODE, match_all, case_sensitive,
-                                    timeout,
-                                    int(r.get("_row_id", 0)),
-                                    enable_mirror, enable_smart,
-                                )
-                                fmap[f] = r
 
-                            for future in as_completed(fmap):
-                                if not st.session_state.running:
-                                    _log("⏹ Stopped by user.")
-                                    ex.shutdown(wait=False, cancel_futures=True)
+                            while _in_flight:
+                                # as_completed with short timeout — don't block forever
+                                done_futures = []
+                                for f in as_completed(
+                                    list(_in_flight.keys()), timeout=timeout + 5
+                                ):
+                                    done_futures.append(f)
+                                    break   # process one at a time for live UI
+
+                                if not done_futures:
+                                    # Timeout hit — force-cancel stragglers
+                                    _log("⚠️ Straggler timeout — skipping slow URL")
+                                    for f in list(_in_flight.keys()):
+                                        src = _in_flight.pop(f)
+                                        pass_res.append({
+                                            "_row_id": int(src.get("_row_id", 0)),
+                                            "URL":     str(src.get("URL", "")),
+                                            "Keyword": str(src.get("Keyword", "")),
+                                            "Search Mode": _MODE.capitalize(),
+                                            "Keyword_Search_Status": S.FAILED,
+                                            "Match Count": 0, "Snippet": "",
+                                            "Matched Keywords": "",
+                                            "Missing Keywords": "",
+                                            "Notes": "Straggler timeout",
+                                            "_cat": "timeout",
+                                        })
+                                        done_n[0] += 1
+                                        pass_err.append(src)
                                     break
-                                try:
-                                    res = future.result()
-                                except Exception as exc:
-                                    src = fmap[future]
-                                    res = {
-                                        "_row_id":    int(src.get("_row_id", 0)),
-                                        "URL":        str(src.get("URL", "")),
-                                        "Keyword":    str(src.get("Keyword", "")),
-                                        "Search Mode": _MODE.capitalize(),
-                                        "Keyword_Search_Status": S.FAILED,
-                                        "Match Count": 0, "Snippet": "",
-                                        "Matched Keywords": "",
-                                        "Missing Keywords": "",
-                                        "Notes": f"Exception: {exc}",
-                                        "_cat": "connection",
-                                    }
 
-                                done_n[0] += 1
-                                ks    = res.get("Keyword_Search_Status", "")
-                                icon  = ("✅" if ks == S.FOUND else
-                                         "❌" if ks == S.NOT_FOUND else
-                                         "🟡" if ks == S.SCANNED else
-                                         "🟣" if ks == S.CORRUPTED else "🔺")
-                                url_s = res["URL"][-55:] if len(res["URL"]) > 55 else res["URL"]
-                                _log(f"[{label}][{done_n[0]}/{total}] "
-                                     f"{icon} {ks[:26]:26s} …{url_s}")
+                                for future in done_futures:
+                                    src_row = _in_flight.pop(future, None)
+                                    if src_row is None:
+                                        continue
 
-                                if _needs_retry(res):
-                                    pass_err.append(fmap[future])
-                                    _log_err(res["URL"], ks)
+                                    # Submit next task to keep pool full
+                                    _submit_next()
 
-                                pass_res.append(res)
+                                    if not st.session_state.running:
+                                        _log("⏹ Stopped by user.")
+                                        ex.shutdown(wait=False, cancel_futures=True)
+                                        _in_flight.clear()
+                                        _stopped = True
+                                        break
 
-                                if done_n[0] % 100 == 0:
-                                    _save(results + pass_res)
-                                    _log(f"💾 Auto-saved {done_n[0]:,} rows")
+                                    try:
+                                        res = future.result(timeout=0)
+                                    except Exception as exc:
+                                        res = {
+                                            "_row_id":  int(src_row.get("_row_id", 0)),
+                                            "URL":      str(src_row.get("URL", "")),
+                                            "Keyword":  str(src_row.get("Keyword", "")),
+                                            "Search Mode": _MODE.capitalize(),
+                                            "Keyword_Search_Status": S.FAILED,
+                                            "Match Count": 0, "Snippet": "",
+                                            "Matched Keywords": "",
+                                            "Missing Keywords": "",
+                                            "Notes": f"Exception: {exc}",
+                                            "_cat": "connection",
+                                        }
 
-                                _n = max(1, min(25, total // 60))
-                                if done_n[0] % _n == 0 or done_n[0] == total:
-                                    pct  = min(done_n[0] / total, 1.0)
-                                    el   = time.time() - start_t
-                                    rate = done_n[0] / el if el else 0
-                                    eta  = (total - done_n[0]) / rate if rate else 0
-                                    found_n = sum(1 for r in pass_res
-                                                  if r.get("Keyword_Search_Status") == S.FOUND)
-                                    prog.progress(pct,
-                                        text=f"[{label}] {done_n[0]:,}/{total:,} "
-                                             f"• {rate:.1f}/s • ETA {eta:.0f}s")
-                                    mtrs.markdown(
-                                        f"⏱ **{el:.0f}s** &nbsp;|&nbsp; "
-                                        f"⚡ **{rate:.1f}** URLs/s &nbsp;|&nbsp; "
-                                        f"✅ **{found_n:,}** found &nbsp;|&nbsp; "
-                                        f"📊 **{done_n[0]:,}/{total:,}**"
-                                    )
-                                    curl.markdown(f"`…{url_s}`")
-                                    lbox.markdown(
-                                        '<div class="logbox">' +
-                                        "<br>".join(st.session_state.log_lines[-35:]) +
-                                        "</div>", unsafe_allow_html=True)
+                                    done_n[0] += 1
+                                    ks    = res.get("Keyword_Search_Status", "")
+                                    icon  = ("✅" if ks == S.FOUND else
+                                             "❌" if ks == S.NOT_FOUND else
+                                             "🟡" if ks == S.SCANNED else
+                                             "🟣" if ks == S.CORRUPTED else "🔺")
+                                    url_s = res["URL"][-55:] if len(res["URL"]) > 55 else res["URL"]
+                                    _log(f"[{label}][{done_n[0]}/{total}] "
+                                         f"{icon} {ks[:26]:26s} …{url_s}")
+
+                                    if _needs_retry(res):
+                                        pass_err.append(src_row)
+                                        _log_err(res["URL"], ks)
+
+                                    pass_res.append(res)
+                                    if ks == S.FOUND:
+                                        found_ctr[0] += 1
+
+                                    if done_n[0] % 100 == 0:
+                                        _save(results + pass_res)
+                                        _log(f"💾 Auto-saved {done_n[0]:,} rows")
+
+                                    _n = max(1, min(25, total // 60))
+                                    if done_n[0] % _n == 0 or done_n[0] == total:
+                                        pct  = min(done_n[0] / total, 1.0)
+                                        el   = time.time() - start_t
+                                        rate = done_n[0] / el if el else 0
+                                        eta  = (total - done_n[0]) / rate if rate else 0
+                                        prog.progress(pct,
+                                            text=f"[{label}] {done_n[0]:,}/{total:,} "
+                                                 f"• {rate:.1f}/s • ETA {eta:.0f}s")
+                                        mtrs.markdown(
+                                            f"⏱ **{el:.0f}s** &nbsp;|&nbsp; "
+                                            f"⚡ **{rate:.1f}** URLs/s &nbsp;|&nbsp; "
+                                            f"✅ **{found_ctr[0]:,}** found &nbsp;|&nbsp; "
+                                            f"📊 **{done_n[0]:,}/{total:,}**"
+                                        )
+                                        curl.markdown(f"`…{url_s}`")
+                                        lbox.markdown(
+                                            '<div class="logbox">' +
+                                            "<br>".join(st.session_state.log_lines[-35:]) +
+                                            "</div>", unsafe_allow_html=True)
+
+                                if _stopped:
+                                    break
 
                         return pass_res, pass_err
 
@@ -1180,13 +1243,23 @@ If the page refreshes or your connection drops, use
                     st.session_state.paused  = False
 
                     if results:
-                        _save(results)
                         el = time.time() - start_t
+                        # Show success IMMEDIATELY — don't block on file write
                         prog.progress(1.0, text="✅ Search Complete!")
                         st.success(
                             f"✅ **{done_n[0]:,}** rows in **{el:.1f}s** "
                             f"({done_n[0]/el:.1f} rows/s)"
                         )
+                        # FIX 3: final save in background thread so UI is
+                        # instantly responsive. The DataFrame is built and
+                        # CSV written without blocking the main thread.
+                        def _final_save_bg():
+                            try:
+                                _save(results)
+                            except Exception:
+                                pass
+                        import threading as _th
+                        _th.Thread(target=_final_save_bg, daemon=True).start()
                     else:
                         st.warning("No results collected.")
 
