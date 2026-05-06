@@ -609,6 +609,15 @@ def process_one(url: str, raw_keyword: str, search_mode: str,
 
     norm = _normalize(text)
 
+    # BUG 2 FIX: very short extracted text = corrupted/garbage file.
+    # Real documents have at least ~150 chars of useful text.
+    # Old/archived stubs return 200 OK but near-empty content.
+    # These would otherwise fall through to keyword search → "Not Found"
+    # even though the correct classification is "Corrupted".
+    _MIN_USEFUL_CHARS = 150
+    if len(norm.strip()) < _MIN_USEFUL_CHARS:
+        return done(Keyword_Search_Status=S.CORRUPTED, _cat="corrupted")
+
     if use_smart and _is_not_found_page(norm):
         # Server returned a 200 OK "not found" HTML page → treat as failed
         return done(Keyword_Search_Status=S.FAILED,
@@ -1113,17 +1122,24 @@ If the page refreshes or your connection drops, use
                                     break
 
                             while _in_flight:
-                                # as_completed with short timeout — don't block forever
+                                # BUG 1 FIX: as_completed raises TimeoutError (not just
+                                # returning empty) when the timeout expires.
+                                # Catch it explicitly so it never reaches Streamlit.
                                 done_futures = []
-                                for f in as_completed(
-                                    list(_in_flight.keys()), timeout=timeout + 5
-                                ):
-                                    done_futures.append(f)
-                                    break   # process one at a time for live UI
+                                try:
+                                    for f in as_completed(
+                                        list(_in_flight.keys()), timeout=timeout + 5
+                                    ):
+                                        done_futures.append(f)
+                                        break   # one at a time for live UI
+                                except Exception:
+                                    # TimeoutError or any other error from as_completed
+                                    # → treat all remaining in-flight as straggler failures
+                                    done_futures = []
 
                                 if not done_futures:
-                                    # Timeout hit — force-cancel stragglers
-                                    _log("⚠️ Straggler timeout — skipping slow URL")
+                                    # Timeout hit — mark stragglers as Failed and move on
+                                    _log(f"⚠️ {len(_in_flight)} straggler(s) timed out — marking Failed")
                                     for f in list(_in_flight.keys()):
                                         src = _in_flight.pop(f)
                                         pass_res.append({
