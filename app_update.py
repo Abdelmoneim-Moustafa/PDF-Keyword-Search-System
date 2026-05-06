@@ -1,35 +1,16 @@
 """
-PDF Keyword Search System — v4.0
-Single • Multi • Table Search Engine
-
-Spec: Unified Online Platform Specification (v4)
-
-Architecture
-────────────
-  Section 1   Constants + clean user-facing Status model
-  Section 2   Network layer   (session, rate-limiter, block-detector)
-  Section 3   URL cache + mirror fallback
-  Section 4   Download + retry + precise error classification
-  Section 5   Text extraction (PDF + HTML)
-  Section 6   Text normalization + full-document multi-mode keyword search
-  Section 7   Clean output builder (user-facing columns only)
-  Section 8   Excel / CSV export helpers
-  Section 9   Autosave / Recovery (disk-backed)
-  Section 10  Session state
-  Section 11  Streamlit UI (sidebar + 4 tabs)
+PDF Keyword Search System — v5.0
+Fast • 5-Status • Light & Dark Adaptive
 """
 
-# ═══════════════════════════════════════════════════════════════════
-# IMPORTS
-# ═══════════════════════════════════════════════════════════════════
 import streamlit as st
 import pandas as pd
-import io, os, re, time, random, threading, tempfile, hashlib, json
+import io, os, re, time, random, threading, tempfile, json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 
-import fitz          # PyMuPDF
+import fitz
 import urllib3
 import requests
 from requests.adapters import HTTPAdapter
@@ -38,7 +19,7 @@ from urllib3.util.retry import Retry
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 1 — Page config + CSS
+# PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="PDF Keyword Search",
@@ -47,184 +28,265 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ═══════════════════════════════════════════════════════════════════
+# CSS — Adaptive light + dark using CSS variables
+# Colors chosen to be clear and readable in BOTH modes
+# ═══════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
-.main { background-color: #0b0f1a; }
-section[data-testid="stSidebar"] { background:#0b0f1a; border-right:1px solid #1c2333; }
+/* ── Adaptive color tokens ── */
+:root {
+    --bg-card:      #ffffff;
+    --bg-sidebar:   #f8f9fc;
+    --bg-log:       #f4f6fb;
+    --bg-info:      #eef4ff;
+    --border:       #d0d7e8;
+    --text-primary: #1a1d23;
+    --text-muted:   #6b7a99;
+    --accent:       #1a73e8;
+    --accent-soft:  #e8f0fe;
+    --success:      #1e7e34;
+    --success-bg:   #d4edda;
+    --warn-bg:      #fff3cd;
+    --warn-txt:     #856404;
+    --err-bg:       #f8d7da;
+    --err-txt:      #721c24;
+    --scan-bg:      #fff8e1;
+    --scan-txt:     #795548;
+    --fail-bg:      #fce4ec;
+    --fail-txt:     #880e4f;
+    --corrupt-bg:   #ede7f6;
+    --corrupt-txt:  #4527a0;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg-card:      #1a1f2e;
+        --bg-sidebar:   #111827;
+        --bg-log:       #0f1117;
+        --bg-info:      #0d1a2e;
+        --border:       #2a3448;
+        --text-primary: #e2e8f0;
+        --text-muted:   #6b7fa3;
+        --accent:       #4da3ff;
+        --accent-soft:  #0d1a2e;
+        --success:      #4caf50;
+        --success-bg:   #0d2e14;
+        --warn-bg:      #2e2200;
+        --warn-txt:     #ffd54f;
+        --err-bg:       #2e0a0a;
+        --err-txt:      #ff5252;
+        --scan-bg:      #2e2200;
+        --scan-txt:     #ffcc02;
+        --fail-bg:      #2e0022;
+        --fail-txt:     #ff80ab;
+        --corrupt-bg:   #1a0e2e;
+        --corrupt-txt:  #b39ddb;
+    }
+}
+
+/* ── Base ── */
+.main { background: var(--bg-card); }
+section[data-testid="stSidebar"] {
+    background: var(--bg-sidebar) !important;
+    border-right: 1px solid var(--border) !important;
+}
 
 /* ── Header ── */
 .hdr {
-    background: linear-gradient(135deg,#0a1628 0%,#112240 60%,#0a1a2e 100%);
-    border:1px solid #1e3a5f; border-radius:14px;
-    padding:22px 32px 18px; margin-bottom:20px;
-    display:flex; align-items:center; justify-content:space-between;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--accent);
+    border-radius: 10px;
+    padding: 18px 26px;
+    margin-bottom: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 2px 8px rgba(0,0,0,.07);
 }
-.hdr h1  { font-size:1.85rem; font-weight:800; color:#00d4ff; margin:0; }
-.hdr p   { font-size:0.85rem; color:#5a7fa3; margin:4px 0 0; }
-.badge   { font-size:0.78rem; font-weight:700; padding:5px 13px;
-           border-radius:20px; letter-spacing:0.3px; }
-.b-ready   { background:#0a2e14; color:#00e676; border:1px solid #00e676; }
-.b-running { background:#2e2200; color:#ffd600; border:1px solid #ffd600; }
-.b-done    { background:#1a0d00; color:#ff9800; border:1px solid #ff9800; }
+.hdr h1 {
+    font-size: 1.65rem; font-weight: 800;
+    color: var(--accent); margin: 0;
+}
+.hdr p { font-size: 0.82rem; color: var(--text-muted); margin: 3px 0 0; }
+
+/* ── Status badges ── */
+.badge { font-size: 0.76rem; font-weight: 700; padding: 4px 12px;
+         border-radius: 16px; letter-spacing: .3px; border: 1px solid; }
+.b-ready   { background: var(--success-bg); color: var(--success);
+             border-color: var(--success); }
+.b-running { background: var(--warn-bg);    color: var(--warn-txt);
+             border-color: var(--warn-txt); }
+.b-done    { background: var(--accent-soft); color: var(--accent);
+             border-color: var(--accent); }
 
 /* ── Stat cards ── */
-.sc { background:#0f1623; border:1px solid #1c2d44; border-radius:10px;
-      padding:15px 18px; text-align:center; }
-.sc-n { font-size:1.85rem; font-weight:800; line-height:1; }
-.sc-l { font-size:0.7rem; color:#5a7fa3; margin-top:4px;
-        text-transform:uppercase; letter-spacing:0.5px; }
+.sc {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    text-align: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,.05);
+}
+.sc-n { font-size: 1.75rem; font-weight: 800; line-height: 1; }
+.sc-l { font-size: 0.68rem; color: var(--text-muted); margin-top: 4px;
+        text-transform: uppercase; letter-spacing: .5px; }
 
 /* ── Limit banner ── */
-.lim { background:linear-gradient(90deg,#8b2500,#c43d00);
-       color:#fff; border-radius:8px; padding:8px 16px;
-       font-weight:700; font-size:0.95rem; text-align:center; }
+.lim {
+    background: linear-gradient(90deg, #c0392b, #e74c3c);
+    color: #fff; border-radius: 8px;
+    padding: 8px 14px; font-weight: 700;
+    font-size: .9rem; text-align: center; margin: 6px 0;
+}
 
 /* ── Log box ── */
 .logbox {
-    background:#080c14; border:1px solid #1c2333; border-radius:10px;
-    padding:14px 18px; font-family:"Courier New",monospace; font-size:0.78rem;
-    color:#7a8fa8; max-height:280px; overflow-y:auto; line-height:1.6;
+    background: var(--bg-log);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-family: "Courier New", monospace;
+    font-size: 0.76rem;
+    color: var(--text-muted);
+    max-height: 260px;
+    overflow-y: auto;
+    line-height: 1.65;
 }
 
-/* ── Pre-process box ── */
-.ppbox { background:#0f1623; border:1px solid #1c2d44; border-radius:10px;
-         padding:15px 20px; margin:10px 0; }
-.ppr   { display:flex; justify-content:space-between; padding:3px 0;
-         font-size:0.86rem; }
-.ppk   { color:#5a7fa3; }
-.ppv   { color:#d0dae8; font-weight:600; }
+/* ── Pre-process summary box ── */
+.ppbox {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 15px 20px;
+    margin: 10px 0;
+}
+.ppr { display: flex; justify-content: space-between;
+       padding: 3px 0; font-size: 0.86rem; }
+.ppk { color: var(--text-muted); }
+.ppv { color: var(--text-primary); font-weight: 600; }
 
 /* ── Info note ── */
-.info-note { background:#0a1a2e; border-left:3px solid #00d4ff;
-             border-radius:0 8px 8px 0; padding:10px 16px;
-             font-size:0.84rem; color:#7ab8d4; margin:10px 0; }
+.info-note {
+    background: var(--bg-info);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    padding: 10px 16px;
+    font-size: 0.83rem;
+    color: var(--text-muted);
+    margin: 10px 0;
+}
 
 /* ── Tabs ── */
-.stTabs [data-baseweb="tab-list"] { gap:5px; border-bottom:1px solid #1c2333; }
-.stTabs [data-baseweb="tab"] { background:#0f1623; border-radius:8px 8px 0 0;
-    color:#5a7fa3; font-weight:600; padding:7px 18px;
-    border:1px solid #1c2333; border-bottom:none; }
-.stTabs [aria-selected="true"] { background:#1c2d44 !important;
-    color:#00d4ff !important; border-color:#00d4ff !important; }
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px; border-bottom: 2px solid var(--border); }
+.stTabs [data-baseweb="tab"] {
+    background: var(--bg-card);
+    border-radius: 8px 8px 0 0;
+    color: var(--text-muted);
+    font-weight: 600; padding: 7px 18px;
+    border: 1px solid var(--border); border-bottom: none; }
+.stTabs [aria-selected="true"] {
+    background: var(--accent-soft) !important;
+    color: var(--accent) !important;
+    border-color: var(--accent) !important; }
 
 /* ── Buttons ── */
-.stButton > button { border-radius:8px; font-weight:700; transition:all .15s; }
-.stButton > button:hover { transform:translateY(-1px); }
-hr.div { border:none; border-top:1px solid #1c2333; margin:14px 0; }
+.stButton > button {
+    border-radius: 7px; font-weight: 700; transition: all .12s; }
+.stButton > button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 3px 8px rgba(0,0,0,.15); }
+
+/* ── Section divider ── */
+hr.d { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
 </style>
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 2 — Constants + Status model
+# SECTION 1 — Constants + exact 5-status model
 # ═══════════════════════════════════════════════════════════════════
 SEARCH_LIMIT     = 50_000
-DEFAULT_WORKERS  = 6
-DEFAULT_TIMEOUT  = 20
-_CONNECT_TIMEOUT = 12      # TCP connect timeout (separate from read)
-_MIN_DELAY_SECS  = 0.3     # min gap per host (all threads)
-_BLOCK_THRESHOLD = 5       # consecutive failures → blocked
-_BLOCK_COOLDOWN  = 30      # seconds to pause when blocked
+DEFAULT_WORKERS  = 10     # faster default
+DEFAULT_TIMEOUT  = 15     # tighter timeout for speed
+_CONNECT_TIMEOUT = 8      # fast TCP fail
+_MIN_DELAY_SECS  = 0.1    # light rate limiting
+_BLOCK_THRESHOLD = 6
+_BLOCK_COOLDOWN  = 25
 
 _ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
-# ── Disk paths ────────────────────────────────────────────────────
 _TMP            = tempfile.gettempdir()
 _AUTOSAVE_CSV   = os.path.join(_TMP, "pdf_search_autosave.csv")
 _JOB_STATE_FILE = os.path.join(_TMP, "pdf_search_job_state.json")
 
 
 class S:
-    """
-    Single source of truth for all user-facing result values.
-    Spec §10.5 / §11: clean public statuses only.
-    Technical error detail lives in internal logs, not in the output file.
-    """
-    # ── User-facing (shown in output file) ────────────────────────
-    FOUND          = "Found"
-    NOT_FOUND      = "Not Found"
-    PARTIAL        = "Partial Match"
-    NON_SEARCHABLE = "Non searchable"   # spec §10.5 — replaces long scanned message
-
-    # ── Internal only (logged, not in clean output) ───────────────
-    URL_NOT_FOUND  = "URL Not Found"
-    SSL_ERROR      = "SSL Error"
-    TIMEOUT        = "Timeout"
-    BLOCKED        = "Blocked / Rate Limited"
-    CORRUPTED      = "File Not Available"
-    INVALID_URL    = "Invalid URL"
-    CONNECTION_ERR = "Connection Error"
-    HTML_NOT_FOUND = "URL Not Found"    # merged with URL_NOT_FOUND for output
+    """Exact 5 user-facing status values — nothing else in output."""
+    FOUND      = "Found"
+    NOT_FOUND  = "Not Found"
+    SCANNED    = "PDF is Non searchable,Advanced Scanned Extraction can make the PDF searchable."
+    CORRUPTED  = "PDF Not mirrored / Corrupted"
+    FAILED     = "Failed to get PDF text"   # network / download / parse failures
 
 
-# Statuses that trigger the retry pass
-_RETRY_STATUSES = {
-    S.TIMEOUT, S.SSL_ERROR, S.BLOCKED,
-    S.CONNECTION_ERR, S.CORRUPTED,
-}
+# Internal categories → mapped to one of the 5 public statuses
+_FAIL_CATS   = {"ssl", "timeout", "blocked", "connection", "404", "corrupted"}
+_RETRY_CATS  = {"ssl", "timeout", "connection"}   # retry these; not 404/blocked
 
-# Statuses that map to "Notes" in the clean output file
-# (never shown in the Result column — spec §11 / §15)
-_TECHNICAL_STATUSES = {
-    S.URL_NOT_FOUND, S.SSL_ERROR, S.TIMEOUT, S.BLOCKED,
-    S.CORRUPTED, S.INVALID_URL, S.CONNECTION_ERR, S.HTML_NOT_FOUND,
-}
-
-# ── Clean output columns (spec §11) ───────────────────────────────
-# These are what the user sees in the downloaded file.
-_CLEAN_COLS = [
+# Output columns — exact order
+_OUT_COLS = [
     "URL", "Keyword", "Search Mode",
-    "Result",          # user-facing: Found / Not Found / Partial Match / Non searchable
-    "Match Count",     # total occurrences across document
-    "Snippet",         # context around first match
+    "Keyword_Search_Status",   # main result — one of the 5 above
+    "Match Count",
+    "Snippet",
     "Matched Keywords",
     "Missing Keywords",
-    "Notes",           # non-empty only for errors — keeps main Result clean
+    "Notes",                   # non-empty only for FAILED rows
 ]
 
-# ── Internal columns (used during processing, stripped before export) ─
-_INT_COLS = [
-    "_row_id", "Extraction Option",
-    "URL_Status", "URL_Search_Status", "Keyword_Status",
-    "feature_name", "_raw_status",
-]
-
-# ── HTML "not found" phrases (Bug 7 fix — expanded) ──────────────
 _HTML_NFP = [
-    "page not found", "404 not found", "404 error",
-    "file not found", "resource not found", "does not exist",
-    "error 404", "no results found", "page unavailable",
-    "page cannot be found", "the page you requested",
-    "sorry, we couldn", "could not be found",
-    "this page doesn", "we couldn", "not available",
+    "page not found", "404 not found", "404 error", "file not found",
+    "resource not found", "does not exist", "error 404", "no results found",
+    "page unavailable", "could not be found", "not available",
+    "page cannot be found", "this page doesn", "sorry, we couldn",
 ]
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 3 — Network layer
+# SECTION 2 — Network layer
 # ═══════════════════════════════════════════════════════════════════
 _thread_local = threading.local()
 
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept":          "text/html,application/pdf,application/xhtml+xml,*/*;q=0.8",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Accept":          "text/html,application/pdf,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
-    "Referer":         "https://source.z2data.com/",
+    "Referer":         "https://www.google.com/",
 }
+
+_rate_lock  = threading.Lock()
+_last_req:  dict[str, float] = {}
+_block_lock = threading.Lock()
+_consec_fail: dict[str, int]   = {}
+_blocked_til: dict[str, float] = {}
+_cache_lock  = threading.Lock()
+_url_cache:  dict[str, tuple[str, str]] = {}
 
 
 def _make_session() -> requests.Session:
     sess = requests.Session()
     sess.headers.update(_HEADERS)
-    sess.verify = False   # handles SSL cert mismatch on source1.z2data.com
-    no_retry = Retry(total=0, raise_on_status=False)
-    adapter  = HTTPAdapter(max_retries=no_retry, pool_connections=20, pool_maxsize=20)
-    sess.mount("https://", adapter)
-    sess.mount("http://",  adapter)
+    sess.verify = False
+    a = HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False),
+                    pool_connections=25, pool_maxsize=25)
+    sess.mount("https://", a)
+    sess.mount("http://", a)
     return sess
 
 
@@ -234,9 +296,10 @@ def _get_session(fresh: bool = False) -> requests.Session:
     return _thread_local.session
 
 
-# ── Rate limiter (per-host, all threads) ─────────────────────────
-_rate_lock = threading.Lock()
-_last_req:  dict[str, float] = {}
+def _host(url: str) -> str:
+    try:    return url.split("/")[2]
+    except: return url
+
 
 def _rate_limit(host: str) -> None:
     with _rate_lock:
@@ -246,72 +309,61 @@ def _rate_limit(host: str) -> None:
         _last_req[host] = time.time()
 
 
-# ── Block detector ────────────────────────────────────────────────
-_block_lock    = threading.Lock()
-_consec_fail:   dict[str, int]   = {}
-_blocked_until: dict[str, float] = {}
-
 def _record_failure(host: str) -> None:
     with _block_lock:
         _consec_fail[host] = _consec_fail.get(host, 0) + 1
         if _consec_fail[host] >= _BLOCK_THRESHOLD:
-            _blocked_until[host] = time.time() + _BLOCK_COOLDOWN
-            _consec_fail[host]   = 0
+            _blocked_til[host] = time.time() + _BLOCK_COOLDOWN
+            _consec_fail[host] = 0
+
 
 def _record_success(host: str) -> None:
     with _block_lock:
         _consec_fail[host] = 0
 
+
 def _wait_if_blocked(host: str) -> None:
-    wait = _blocked_until.get(host, 0) - time.time()
+    wait = _blocked_til.get(host, 0) - time.time()
     if wait > 0:
         time.sleep(wait)
 
-def _host(url: str) -> str:
-    try:    return url.split("/")[2]
-    except: return url
-
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 4 — URL cache + alternate URLs
-# ═══════════════════════════════════════════════════════════════════
-_cache_lock = threading.Lock()
-_url_cache: dict[str, tuple[str, str]] = {}   # url → (text, ext_status)
-
 
 def _clear_all_state() -> None:
-    """Reset every per-run cache and rate-limiter — must be called on new run."""
     with _cache_lock:   _url_cache.clear()
-    with _block_lock:   _consec_fail.clear(); _blocked_until.clear()
+    with _block_lock:   _consec_fail.clear(); _blocked_til.clear()
     with _rate_lock:    _last_req.clear()
 
 
 def _get_alternate_urls(url: str) -> list[str]:
-    """Mirror swap (source ↔ source1) + /web/ path stripping for z2data.com."""
+    """Swap between mirror hosts + strip /web/ path segment."""
     alts: list[str] = []
-    if "//source1.z2data.com" in url:
-        alts.append(url.replace("//source1.z2data.com", "//source.z2data.com", 1))
-    elif "//source.z2data.com" in url:
-        alts.append(url.replace("//source.z2data.com", "//source1.z2data.com", 1))
+    parts = url.split("//", 1)
+    if len(parts) == 2:
+        host_path = parts[1]
+        host      = host_path.split("/")[0]
+        # Generic mirror swap: host ↔ host with "1" appended/removed
+        if host.endswith("1") and not host.endswith("11"):
+            alt_host = host[:-1]
+        else:
+            alt_host = host + "1"
+        alts.append(url.replace(f"//{host}", f"//{alt_host}", 1))
     if "/web/" in url:
-        s = url.replace("/web/", "/", 1)
-        alts.append(s)
-        if "//source1.z2data.com" in s:
-            alts.append(s.replace("//source1.z2data.com", "//source.z2data.com", 1))
-        elif "//source.z2data.com" in s:
-            alts.append(s.replace("//source.z2data.com", "//source1.z2data.com", 1))
+        stripped = url.replace("/web/", "/", 1)
+        alts.append(stripped)
+        for a in list(alts[:-1]):
+            if "/web/" in a:
+                alts.append(a.replace("/web/", "/", 1))
     return alts
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 5 — Download + retry + error classification
+# SECTION 3 — Download + retry
 # ═══════════════════════════════════════════════════════════════════
-def _download_one(url: str, timeout: int, fresh: bool = False
-                  ) -> tuple[bytes | None, str]:
-    """Single HTTP GET. Returns (bytes | None, error_category)."""
+def _download_one(url: str, timeout: int,
+                  fresh: bool = False) -> tuple[bytes | None, str]:
     host = _host(url)
     _wait_if_blocked(host)
     _rate_limit(host)
     session = _get_session(fresh=fresh)
-
     try:
         resp = session.get(url, timeout=(_CONNECT_TIMEOUT, timeout),
                            stream=False, allow_redirects=True)
@@ -321,18 +373,17 @@ def _download_one(url: str, timeout: int, fresh: bool = False
         _record_failure(host)
         code = resp.status_code
         if code == 429:
-            time.sleep(5 + random.random() * 5)
+            time.sleep(4 + random.random() * 4)
             return None, "blocked"
         if code == 403:
             return None, "blocked"
         if code in (404, 410):
-            return None, "http_404"
+            return None, "404"
         return None, f"http_{code}"
-
     except Exception as e:
         _record_failure(host)
         s = str(e).lower()
-        if any(w in s for w in ("ssl", "certificate", "handshake", "tls")):
+        if any(w in s for w in ("ssl", "cert", "tls", "handshake")):
             return None, "ssl"
         if any(w in s for w in ("timed out", "timeout", "read timed")):
             return None, "timeout"
@@ -341,44 +392,42 @@ def _download_one(url: str, timeout: int, fresh: bool = False
 
 def _fetch(url: str, session_timeout: int,
            use_mirror: bool = True) -> tuple[bytes | None, str]:
-    """
-    Full download with retry: primary + alternates, 3 attempts each.
-    Returns (bytes | None, S.* status).
-    Permanent failures (404) exit immediately without wasting retries.
-    """
+    """Primary + alternates, 3 attempts each. Permanent 404 exits immediately."""
     candidates = [url] + (_get_alternate_urls(url) if use_mirror else [])
-    last_status = S.TIMEOUT
-    conn_err    = False
+    last_cat = "timeout"
+    conn_err = False
 
     for try_url in candidates:
         for attempt in range(1, 4):
-            content, cat = _download_one(try_url, session_timeout, fresh=(conn_err and attempt == 1))
+            content, cat = _download_one(
+                try_url, session_timeout, fresh=(conn_err and attempt == 1)
+            )
             conn_err = False
 
             if content is not None:
-                # Validate content signature (bug-6 fix: not just size)
                 if len(content) < 32:
-                    last_status = S.CORRUPTED; break
+                    last_cat = "corrupted"; break
                 sig = content[:64].lstrip()
-                is_pdf  = sig.startswith(b"%PDF")
-                is_html = any(t in sig.lower() for t in (b"<html", b"<!doc", b"<head"))
-                if len(content) < 64 and not is_pdf and not is_html:
-                    last_status = S.CORRUPTED; break
+                if len(content) < 64 and \
+                   not sig.startswith(b"%PDF") and \
+                   not any(t in sig.lower() for t in (b"<html", b"<!doc", b"<head")):
+                    last_cat = "corrupted"; break
                 return content, "ok"
 
-            if cat == "http_404":      return None, S.URL_NOT_FOUND
-            if cat == "blocked":       last_status = S.BLOCKED;        break
-            if cat == "ssl":           last_status = S.SSL_ERROR;       break
-            if cat == "timeout":       last_status = S.TIMEOUT;         conn_err = True
-            if cat == "connection":    last_status = S.CONNECTION_ERR;  conn_err = True
+            last_cat = cat
+            if cat == "404":     return None, "404"
+            if cat == "blocked": break              # no retry on rate-limit
+            if cat == "ssl":     break              # SSL won't self-fix on retry
+            if cat in ("timeout", "connection"):
+                conn_err = True
 
             if attempt < 3:
-                time.sleep((2 ** attempt) * (0.75 + 0.5 * random.random()))
+                time.sleep((2 ** attempt) * (0.5 + 0.5 * random.random()))
 
-    return None, last_status
+    return None, last_cat
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 6 — Text extraction
+# SECTION 4 — Text extraction
 # ═══════════════════════════════════════════════════════════════════
 def _extract_pdf(data: bytes) -> tuple[str, str]:
     try:
@@ -397,11 +446,9 @@ class _HtmlStripper(HTMLParser):
         self.parts: list[str] = []
         self._skip = False
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "noscript", "head"):
-            self._skip = True
+        if tag in ("script", "style", "noscript", "head"): self._skip = True
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript", "head"):
-            self._skip = False
+        if tag in ("script", "style", "noscript", "head"): self._skip = False
     def handle_data(self, data):
         if not self._skip:
             s = data.strip()
@@ -423,16 +470,12 @@ def _extract_html(data: bytes) -> tuple[str, str]:
         return "", f"error:{e}"
 
 
-def _get_text_cached(url: str, content: bytes, is_html: bool) -> tuple[str, str]:
-    """
-    Extract text with URL-level cache.
-    Same document downloaded for keyword A is reused for keyword B.
-    Spec §10.4: Duplicate URL Optimization.
-    """
+def _get_text_cached(url: str, content: bytes,
+                     is_html: bool) -> tuple[str, str]:
+    """URL-level text cache — same document never extracted twice."""
     with _cache_lock:
         if url in _url_cache:
             return _url_cache[url]
-
     if is_html:
         text, status = _extract_html(content)
         if not text and "error:" not in status:
@@ -441,26 +484,21 @@ def _get_text_cached(url: str, content: bytes, is_html: bool) -> tuple[str, str]
         text, status = _extract_pdf(content)
         if "error:" in status:
             text, status = _extract_html(content)
-
     with _cache_lock:
         _url_cache[url] = (text, status)
     return text, status
 
 
 def _is_not_found_page(text: str) -> bool:
-    """Detect 200-OK responses that are actually 'not found' HTML pages."""
     if not text: return False
-    sample = text[:1000].lower()
-    return any(p in sample for p in _HTML_NFP)
+    return any(p in text[:1000].lower() for p in _HTML_NFP)
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 7 — Text normalization + full-document keyword search
+# SECTION 5 — Normalization + keyword search
 # ═══════════════════════════════════════════════════════════════════
 def _normalize(text: str) -> str:
-    """Clean extracted text before search — spec §10.1 full document search."""
     text = _ILLEGAL_RE.sub(" ", text)
-    text = text.replace("\u00ad", "")    # soft hyphen
-    text = text.replace("\u00a0", " ")   # non-breaking space
+    text = text.replace("\u00ad", "").replace("\u00a0", " ")
     text = re.sub(r"-\s*\n\s*", "", text)
     text = re.sub(r"\s+", " ", text)
     return text
@@ -468,66 +506,43 @@ def _normalize(text: str) -> str:
 
 def _parse_keywords(raw: str, mode: str) -> list[str]:
     raw = str(raw).strip()
-    if mode == "single":
-        return [raw]
+    if mode == "single": return [raw]
     if mode in ("multi", "table"):
         parts = [k.strip() for k in raw.split("|") if k.strip()]
         return parts if parts else [raw]
-    # auto
     if "|" in raw:
         return [k.strip() for k in raw.split("|") if k.strip()]
     return [raw]
 
 
-def _search_keyword(text: str, keyword: str, case_sensitive: bool) -> int:
-    """
-    Count ALL occurrences of keyword in text.
-    Spec §10.2: must count repeated occurrences, not just first.
-    Returns 0 if not found.
-    """
+def _count_keyword(text: str, keyword: str, case_sensitive: bool) -> int:
     if not text or not keyword: return 0
     flags = 0 if case_sensitive else re.IGNORECASE
-    try:
-        return len(re.findall(re.escape(keyword.strip()), text, flags))
-    except re.error:
-        return 0
+    try:    return len(re.findall(re.escape(keyword.strip()), text, flags))
+    except: return 0
 
 
 def _search_all(text: str, keywords: list[str], case_sensitive: bool,
                 match_all: bool) -> tuple[str, list[str], list[str], int]:
-    """
-    Multi-keyword full-document search.
-    Returns (result_status, found_kws, missing_kws, total_count).
-    """
-    found:   list[str] = []
-    missing: list[str] = []
-    total = 0
-
+    found, missing, total = [], [], 0
     for kw in keywords:
-        cnt = _search_keyword(text, kw, case_sensitive)
-        if cnt > 0:
-            found.append(kw)
-            total += cnt
-        else:
-            missing.append(kw)
-
-    if not keywords:
-        return S.NOT_FOUND, [], [], 0
-    if len(found) == len(keywords):
-        return S.FOUND, found, [], total
+        cnt = _count_keyword(text, kw, case_sensitive)
+        (found if cnt > 0 else missing).append(kw)
+        total += cnt
+    if not keywords: return S.NOT_FOUND, [], [], 0
+    if len(found) == len(keywords): return S.FOUND, found, [], total
     if found:
-        return (S.PARTIAL if match_all else S.FOUND), found, missing, total
+        # match_all → partial; match_any → still Found
+        status = S.NOT_FOUND if match_all else S.FOUND
+        # (we keep partial logic but map to NOT_FOUND when match_all
+        #  and not all found — stays within 5 statuses)
+        return (S.FOUND if not match_all else S.NOT_FOUND), found, missing, total
     return S.NOT_FOUND, [], missing, 0
 
 
-def _best_snippet(text: str, keyword: str, ctx: int = 100) -> str:
-    """
-    Richest unique context window around any match.
-    Spec §10.3: context snippets.
-    """
+def _best_snippet(text: str, keyword: str, ctx: int = 120) -> str:
     if not text or not keyword: return ""
-    kw = str(keyword).lower()
-    tl = text.lower()
+    kw = str(keyword).lower(); tl = text.lower()
     positions, start, best, seen = [], 0, "", set()
     while True:
         i = tl.find(kw, start)
@@ -539,159 +554,114 @@ def _best_snippet(text: str, keyword: str, ctx: int = 100) -> str:
         if not raw or raw in seen: continue
         seen.add(raw)
         cand = ("…" if s > 0 else "") + raw + ("…" if e < len(text) else "")
-        if len(raw) > len(best.replace("…", "")):
-            best = cand
+        if len(raw) > len(best.replace("…", "")): best = cand
     return best
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 8 — Main per-row processor
+# SECTION 6 — Main per-row processor
+# Returns ONE dict. Status is always one of the exact 5 values.
 # ═══════════════════════════════════════════════════════════════════
 def process_one(url: str, raw_keyword: str, search_mode: str,
                 match_all: bool, case_sensitive: bool,
                 session_timeout: int, row_id: int = 0,
                 use_mirror: bool = True,
-                use_smart: bool = True) -> dict:
-    """
-    Download + extract + search.  Returns ONE result dict per call.
-    row_id ensures retry never drops duplicate (URL, Keyword) rows.
-    """
-    out = {
-        "_row_id":         row_id,
-        "URL":             url,
-        "Keyword":         raw_keyword,
-        "Search Mode":     search_mode.capitalize(),
-        "Extraction Option": "",
-        "URL_Status":      None,
-        "URL_Search_Status": "",
-        "Keyword_Status":  None,
-        "feature_name":    raw_keyword,
-        "Result":          "",
-        "Match Count":     0,
-        "Snippet":         "",
+                use_smart: bool  = True) -> dict:
+
+    base = {
+        "_row_id":       row_id,
+        "URL":           url,
+        "Keyword":       raw_keyword,
+        "Search Mode":   search_mode.capitalize(),
+        "Keyword_Search_Status": "",
+        "Match Count":   0,
+        "Snippet":       "",
         "Matched Keywords": "",
         "Missing Keywords": "",
-        "Notes":           "",
-        "_raw_status":     "",
+        "Notes":         "",
+        "_cat":          "",   # internal download category for retry logic
     }
 
     def done(**kw) -> dict:
-        r = dict(out); r.update(kw); return r
+        r = dict(base); r.update(kw); return r
 
     url = str(url).strip()
     if not url or not url.startswith("http"):
-        return done(URL_Status=0, URL_Search_Status=S.INVALID_URL,
-                    Result=S.NOT_FOUND, Notes=S.INVALID_URL,
-                    _raw_status=S.INVALID_URL)
+        return done(Keyword_Search_Status=S.FAILED, Notes="Invalid URL", _cat="404")
 
     is_html = url.lower().split("?")[0].endswith((".html", ".htm"))
-    out["Extraction Option"] = "HTML" if is_html else "PDF"
 
     # ── Download ──────────────────────────────────────────────────
-    content, dl_status = _fetch(url, session_timeout, use_mirror=use_mirror)
+    content, dl_cat = _fetch(url, session_timeout, use_mirror=use_mirror)
 
     if content is None:
-        # Spec §11 / §15: technical errors go to Notes, not Result
-        user_result = S.NOT_FOUND
-        return done(URL_Status=0, URL_Search_Status=dl_status,
-                    Result=user_result, Notes=dl_status,
-                    _raw_status=dl_status)
+        # Map all download failures → S.FAILED
+        return done(Keyword_Search_Status=S.FAILED,
+                    Notes=dl_cat, _cat=dl_cat)
 
-    # ── Extract ───────────────────────────────────────────────────
+    # ── Extract ──────────────────────────────────────────────────
     text, ext_status = _get_text_cached(url, content, is_html)
 
-    if "error:" in ext_status:
-        return done(URL_Status=3, URL_Search_Status="Done",
-                    Result=S.NOT_FOUND, Notes=S.CORRUPTED,
-                    _raw_status=S.CORRUPTED)
+    if "error:" in ext_status or ext_status == "":
+        return done(Keyword_Search_Status=S.CORRUPTED, _cat="corrupted")
 
     if ext_status == "scanned":
-        return done(URL_Status=3, URL_Search_Status="Done",
-                    Keyword_Status=None,
-                    Result=S.NON_SEARCHABLE,        # spec §10.5
-                    _raw_status=S.NON_SEARCHABLE)
+        return done(Keyword_Search_Status=S.SCANNED)
 
     norm = _normalize(text)
 
     if use_smart and _is_not_found_page(norm):
-        return done(URL_Status=3, URL_Search_Status="Done",
-                    Result=S.NOT_FOUND, Notes=S.HTML_NOT_FOUND,
-                    _raw_status=S.HTML_NOT_FOUND)
+        # Server returned a 200 OK "not found" HTML page → treat as failed
+        return done(Keyword_Search_Status=S.FAILED,
+                    Notes="URL returned a not-found page")
 
-    # ── Full-document keyword search ──────────────────────────────
+    # ── Search ────────────────────────────────────────────────────
     keywords = _parse_keywords(raw_keyword, search_mode)
-    result, found_kws, missing_kws, total_count = _search_all(
+    result, found_kws, missing_kws, total_cnt = _search_all(
         norm, keywords, case_sensitive, match_all
     )
-
-    # Best snippet from first matched keyword
     snippet = _best_snippet(norm, found_kws[0]) if found_kws else ""
 
     return done(
-        URL_Status=3, URL_Search_Status="Done", Keyword_Status=3.0,
-        Result=result,
-        Match_Count=total_count,
-        Snippet=snippet,
-        Matched_Keywords=", ".join(found_kws),
-        Missing_Keywords=", ".join(missing_kws),
-        Notes="" if result in (S.FOUND, S.NOT_FOUND, S.PARTIAL) else result,
-        _raw_status=result,
-        # Normalize column names to match _CLEAN_COLS
-        **{"Match Count": total_count,
+        Keyword_Search_Status=result,
+        **{"Match Count":      total_cnt,
+           "Snippet":          snippet,
            "Matched Keywords": ", ".join(found_kws),
            "Missing Keywords": ", ".join(missing_kws)},
     )
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 9 — Clean output builder + Excel/CSV helpers
+# SECTION 7 — Output DataFrame + export helpers
 # ═══════════════════════════════════════════════════════════════════
 def _clean_cell(v):
-    if isinstance(v, str):
-        return _ILLEGAL_RE.sub("", v)
-    return v
+    return _ILLEGAL_RE.sub("", v) if isinstance(v, str) else v
 
 
-def _build_clean_df(result_dicts: list[dict]) -> pd.DataFrame:
-    """
-    Build the user-facing output DataFrame.
-    Spec §11: only clean columns visible; technical fields stripped.
-    """
+def _build_df(result_dicts: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(result_dicts)
-    # Ensure all required columns exist
-    for c in _CLEAN_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    # Normalize match count
-    if "match_count" in df.columns and "Match Count" not in df.columns:
-        df["Match Count"] = df["match_count"]
-    df["Match Count"] = pd.to_numeric(df.get("Match Count", 0), errors="coerce").fillna(0).astype(int)
-    return df[_CLEAN_COLS].copy()
-
-
-def _build_internal_df(result_dicts: list[dict]) -> pd.DataFrame:
-    """Internal DataFrame for autosave — includes all fields for resumability."""
-    return pd.DataFrame(result_dicts)
+    for c in _OUT_COLS:
+        if c not in df.columns: df[c] = ""
+    df["Match Count"] = pd.to_numeric(
+        df.get("Match Count", 0), errors="coerce"
+    ).fillna(0).astype(int)
+    return df[_OUT_COLS].copy()
 
 
 def _to_excel(df: pd.DataFrame) -> bytes:
-    """Export to xlsx with multiple informative sheets. Spec §12: descriptive sheet names."""
     fn = getattr(df, "map", None) or df.applymap
     clean = fn(_clean_cell)
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        # Sheet 1: All Results
         clean.to_excel(w, index=False, sheet_name="All Results")
-        # Sheet 2: Found only
-        found = clean[clean["Result"] == S.FOUND]
-        if not found.empty:
-            found.to_excel(w, index=False, sheet_name="Found")
-        # Sheet 3: Not Found
-        nf = clean[clean["Result"].isin([S.NOT_FOUND, S.PARTIAL, S.NON_SEARCHABLE])]
-        if not nf.empty:
-            nf.to_excel(w, index=False, sheet_name="Not Found and Partial")
-        # Sheet 4: Errors (notes column non-empty)
-        errs = clean[clean["Notes"].astype(str).str.strip() != ""]
-        if not errs.empty:
-            errs.to_excel(w, index=False, sheet_name="Errors and Issues")
+        for status, sheet in [
+            (S.FOUND,     "Found"),
+            (S.NOT_FOUND, "Not Found"),
+            (S.SCANNED,   "Scanned"),
+            (S.CORRUPTED, "Corrupted"),
+            (S.FAILED,    "Failed"),
+        ]:
+            sub = clean[clean["Keyword_Search_Status"] == status]
+            if not sub.empty:
+                sub.to_excel(w, index=False, sheet_name=sheet)
     return buf.getvalue()
 
 
@@ -699,29 +669,26 @@ def _to_csv(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def _result_badge(val) -> str:
+def _status_badge(val) -> str:
+    """Color styles that read well in BOTH light and dark mode."""
     v = str(val)
-    if v == S.FOUND:          return "background-color:#0a2e14;color:#00e676"
-    if v == S.NOT_FOUND:      return "background-color:#2e0a0a;color:#ff5252"
-    if v == S.PARTIAL:        return "background-color:#162600;color:#b2ff59"
-    if v == S.NON_SEARCHABLE: return "background-color:#2e2200;color:#ffd600"
-    return "background-color:#1c1c1c;color:#888"
+    if v == S.FOUND:     return "background-color:#d4edda;color:#1e7e34;font-weight:700"
+    if v == S.NOT_FOUND: return "background-color:#f8d7da;color:#721c24"
+    if v == S.SCANNED:   return "background-color:#fff3cd;color:#795548"
+    if v == S.CORRUPTED: return "background-color:#ede7f6;color:#4527a0"
+    if v == S.FAILED:    return "background-color:#fce4ec;color:#880e4f"
+    return ""
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 10 — Autosave / Job state persistence
+# SECTION 8 — Autosave / Recovery
 # ═══════════════════════════════════════════════════════════════════
 def _autosave(result_dicts: list[dict], processed: int, total: int) -> None:
-    """
-    Save partial results to disk every N rows.
-    Spec §14: autosave + job state so results survive browser refresh.
-    """
     try:
         if result_dicts:
-            _build_internal_df(result_dicts).to_csv(_AUTOSAVE_CSV, index=False)
-        state = {"processed": processed, "total": total,
-                 "saved_at": datetime.now().isoformat()}
+            pd.DataFrame(result_dicts).to_csv(_AUTOSAVE_CSV, index=False)
         with open(_JOB_STATE_FILE, "w") as f:
-            json.dump(state, f)
+            json.dump({"processed": processed, "total": total,
+                       "saved_at": datetime.now().isoformat()}, f)
     except Exception:
         pass
 
@@ -731,14 +698,11 @@ def _load_autosave() -> tuple[pd.DataFrame | None, dict | None]:
     try:
         if os.path.exists(_AUTOSAVE_CSV) and os.path.getsize(_AUTOSAVE_CSV) > 0:
             df = pd.read_csv(_AUTOSAVE_CSV, dtype={"Keyword": str, "URL": str})
-    except Exception:
-        pass
+    except Exception: pass
     try:
         if os.path.exists(_JOB_STATE_FILE):
-            with open(_JOB_STATE_FILE) as f:
-                state = json.load(f)
-    except Exception:
-        pass
+            with open(_JOB_STATE_FILE) as f: state = json.load(f)
+    except Exception: pass
     return df, state
 
 
@@ -748,60 +712,47 @@ def _clear_autosave() -> None:
         except Exception: pass
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 11 — Template builder
+# SECTION 9 — Template
 # ═══════════════════════════════════════════════════════════════════
 def _make_template() -> bytes:
-    """
-    Spec §12: descriptive sheet names, clear examples, all 3 modes.
-    """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         pd.DataFrame({
-            "URL": ["https://source.z2data.com/example.pdf",
-                    "https://source.z2data.com/example2.pdf"],
-            "Keyword": ["51712160148", "4015080000000"],
+            "URL":     ["https://example.com/document.pdf",
+                        "https://example.com/page.html"],
+            "Keyword": ["your keyword here", "another keyword"],
         }).to_excel(w, index=False, sheet_name="Single Search")
-
         pd.DataFrame({
-            "URL": ["https://source.z2data.com/example.pdf"],
-            "Keyword": ["51712160148|4015080000000|EAN5413131"],
+            "URL":     ["https://example.com/document.pdf"],
+            "Keyword": ["keyword1|keyword2|keyword3"],
         }).to_excel(w, index=False, sheet_name="Multi Search")
-
-        pd.DataFrame({
-            "URL": ["https://source.z2data.com/example.pdf"],
-            "Keyword": ["8471.30|8471.41|8471.49"],
-        }).to_excel(w, index=False, sheet_name="Table Search")
     return buf.getvalue()
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 12 — Session state
+# SECTION 10 — Session state
 # ═══════════════════════════════════════════════════════════════════
 for _k, _v in [
-    ("results_df",   None),
-    ("running",      False),
-    ("paused",       False),
-    ("log_lines",    []),
-    ("error_log",    []),
-    ("job_stats",    {}),
+    ("results_df", None), ("running", False), ("paused", False),
+    ("log_lines", []),    ("error_log", []),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 13 — UI Helpers
+# SECTION 11 — UI helpers
 # ═══════════════════════════════════════════════════════════════════
 def _header() -> None:
     if st.session_state.running:
-        badge = '<span class="badge b-running">🟡 Running</span>'
+        badge = '<span class="badge b-running">⏳ Running</span>'
     elif st.session_state.results_df is not None:
-        badge = '<span class="badge b-done">🟠 Complete</span>'
+        badge = '<span class="badge b-done">✅ Complete</span>'
     else:
         badge = '<span class="badge b-ready">🟢 Ready</span>'
     st.markdown(f"""
     <div class="hdr">
         <div>
             <h1>🔍 PDF Keyword Search</h1>
-            <p>Single &nbsp;•&nbsp; Multi &nbsp;•&nbsp; Table &nbsp; Search Engine</p>
+            <p>Fast • Reliable • 5-Status Output</p>
         </div>
         {badge}
     </div>""", unsafe_allow_html=True)
@@ -816,17 +767,17 @@ def _stat(col, n: int, color: str, label: str) -> None:
         </div>""", unsafe_allow_html=True)
 
 
-def _stats_row(total, found, nf, partial, scanned, notes) -> None:
+def _stats_row(total, found, not_found, scanned, corrupted, failed) -> None:
     cols = st.columns(6)
-    _stat(cols[0], total,   "#00d4ff", "Total")
-    _stat(cols[1], found,   "#00e676", "Found")
-    _stat(cols[2], nf,      "#ff5252", "Not Found")
-    _stat(cols[3], partial, "#b2ff59", "Partial")
-    _stat(cols[4], scanned, "#ffd600", "Non Searchable")
-    _stat(cols[5], notes,   "#f48fb1", "Issues")
+    _stat(cols[0], total,     "#1a73e8", "Total")
+    _stat(cols[1], found,     "#1e7e34", "Found")
+    _stat(cols[2], not_found, "#c62828", "Not Found")
+    _stat(cols[3], scanned,   "#795548", "Scanned")
+    _stat(cols[4], corrupted, "#4527a0", "Corrupted")
+    _stat(cols[5], failed,    "#880e4f", "Failed")
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 14 — SIDEBAR
+# SECTION 12 — SIDEBAR
 # ═══════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
@@ -843,10 +794,10 @@ with st.sidebar:
          "Multi Search (|)", "Table Search"],
         index=0,
         help=(
-            "**Auto Detect:** app picks the right mode based on your keyword.\n\n"
+            "**Auto Detect:** picks mode based on keyword content.\n\n"
             "**Single Search:** one keyword per row.\n\n"
-            "**Multi Search:** separate keywords with `|` — e.g. `EAN123|UPC456`.\n\n"
-            "**Table Search:** numeric / code searches, also split on `|`."
+            "**Multi Search:** separate with `|` e.g. `keyword1|keyword2`.\n\n"
+            "**Table Search:** numeric/code values, also split on `|`."
         ),
     )
     _MODE = {
@@ -863,103 +814,96 @@ with st.sidebar:
             ["Match ANY keyword", "Match ALL keywords"],
             index=0,
             help=(
-                "**Match ANY:** Found if at least one keyword is present.\n\n"
-                "**Match ALL:** Found only when every keyword matches. "
-                "Partial Match when some match."
+                "**ANY:** Found if at least one keyword matches.\n\n"
+                "**ALL:** Found only when every keyword matches."
             ),
         ) == "Match ALL keywords"
 
     case_sensitive = st.checkbox("Case-Sensitive Search", value=False,
-        help="OFF: `EAN123` matches `ean123`. ON: exact case only.")
+        help="OFF: `ABC` matches `abc`. ON: exact case required.")
 
     # ── Performance ────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 🚀 Performance")
 
-    workers = st.slider("Concurrent Workers", 2, 12, DEFAULT_WORKERS, 1,
+    workers = st.slider("Concurrent Workers", 2, 20, DEFAULT_WORKERS, 1,
         help=(
-            "• **2–4** — safe for z2data.com\n"
-            "• **6** — balanced default\n"
-            "• **10–12** — fast CDNs only"
+            "• **2–4** → safest, low error rate\n"
+            "• **8–10** → fast default\n"
+            "• **16–20** → fast servers only\n\n"
+            "Reduce if you see many Failed results."
         ))
     timeout = st.slider("Timeout per URL (sec)", 5, 60, DEFAULT_TIMEOUT, 5,
-        help="Increase for large PDFs or slow servers.")
+        help="Max wait per URL. Raise for large/slow documents.")
 
     # ── Advanced ───────────────────────────────────────────────────
     st.markdown("---")
     st.markdown("### 🛡 Advanced")
-    enable_retry  = st.checkbox("Enable Retry System",          value=True)
-    enable_mirror = st.checkbox("Enable Mirror Fallback",       value=True)
-    enable_smart  = st.checkbox("Enable Smart Error Detection", value=True)
-    output_format = st.radio("Output Format", ["Excel (.xlsx)", "CSV (.csv)"], index=0)
+    enable_retry  = st.checkbox("Retry Failed URLs",         value=True)
+    enable_mirror = st.checkbox("Mirror Fallback",           value=True)
+    enable_smart  = st.checkbox("Smart Error Detection",     value=True)
+    output_format = st.radio("Output Format",
+                             ["Excel (.xlsx)", "CSV (.csv)"], index=0)
 
-    # ── Templates ──────────────────────────────────────────────────
+    # ── Template ──────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 📥 Download Template")
+    st.markdown("### 📥 Template")
     st.download_button(
-        "⬇️ Download All Templates",
+        "⬇️ Download Template",
         data=_make_template(),
-        file_name="PDF_Search_Templates.xlsx",
+        file_name="PDF_Search_Template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
 
-    # ── Status Guide ───────────────────────────────────────────────
+    # ── Status Guide ──────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### ℹ️ Result Guide")
+    st.markdown("### 📊 Status Guide")
     st.markdown(f"""
-- 🟢 **{S.FOUND}** — keyword located in document
-- 🔴 **{S.NOT_FOUND}** — document searched, keyword absent
-- 🟩 **{S.PARTIAL}** — some keywords found (Multi / Match ALL)
-- 🟡 **{S.NON_SEARCHABLE}** — image PDF, no text layer
-- 📝 **Issues** — see Notes column in output file
+- 🟢 **{S.FOUND}**
+- 🔴 **{S.NOT_FOUND}**
+- 🟡 **Scanned** (non-searchable PDF)
+- 🟣 **{S.CORRUPTED}**
+- 🔺 **{S.FAILED}**
 """)
 
-    # ── Auto-Save / Recovery ───────────────────────────────────────
+    # ── Recovery ──────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 💾 Auto-Save / Recovery")
+    st.markdown("### 💾 Recovery")
     _saved_df, _job_state = _load_autosave()
-
     if _saved_df is not None:
-        _n = len(_saved_df)
-        _prog = _job_state.get("processed", _n) if _job_state else _n
-        _tot  = _job_state.get("total", _n)     if _job_state else _n
-        _ts   = _job_state.get("saved_at", "")  if _job_state else ""
-        st.success(f"📂 **{_n:,} rows** saved ({_prog:,}/{_tot:,} done)")
-        if _ts:
-            st.caption(f"Last saved: {_ts[:19]}")
-
+        _n    = len(_saved_df)
+        _prog = (_job_state or {}).get("processed", _n)
+        _tot  = (_job_state or {}).get("total", _n)
+        _ts   = (_job_state or {}).get("saved_at", "")
+        st.success(f"📂 **{_n:,} rows** saved ({_prog:,}/{_tot:,})")
+        if _ts: st.caption(f"Saved: {_ts[:19]}")
         _now = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _clean = _build_clean_df(_saved_df.to_dict("records")) if "Result" not in _saved_df.columns else _saved_df[_CLEAN_COLS] if all(c in _saved_df.columns for c in _CLEAN_COLS) else _saved_df
-        st.download_button(
-            f"📥 CSV ({_n:,} rows)",
-            data=_clean.to_csv(index=False).encode("utf-8-sig"),
+        _sv_clean = _saved_df[_OUT_COLS] if all(
+            c in _saved_df.columns for c in _OUT_COLS) else _saved_df
+        st.download_button(f"📥 CSV ({_n:,})",
+            data=_sv_clean.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"autosave_{_now}.csv", mime="text/csv",
-            use_container_width=True, key="sb_csv",
-        )
+            use_container_width=True, key="sb_csv")
         try:
-            st.download_button(
-                f"📥 Excel ({_n:,} rows)",
-                data=_to_excel(_clean),
+            st.download_button(f"📥 Excel ({_n:,})",
+                data=_to_excel(_sv_clean),
                 file_name=f"autosave_{_now}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True, key="sb_xlsx",
-            )
-        except Exception:
-            pass
+                use_container_width=True, key="sb_xlsx")
+        except Exception: pass
         r1, r2 = st.columns(2)
         with r1:
-            if st.button("♻️ Restore", use_container_width=True, key="restore"):
-                st.session_state.results_df = _clean
-                st.success("✅ Restored!")
+            if st.button("♻️ Restore", use_container_width=True, key="rst"):
+                st.session_state.results_df = _sv_clean; st.success("✅")
         with r2:
             if st.button("🗑 Clear", use_container_width=True, key="clr"):
                 _clear_autosave(); st.rerun()
     else:
-        st.caption("Results auto-save every 100 rows during a search.")
+        st.caption("Auto-saves every 100 rows during a search.")
 
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 15 — MAIN CONTENT
+# SECTION 13 — MAIN CONTENT
 # ═══════════════════════════════════════════════════════════════════
 _header()
 
@@ -972,21 +916,20 @@ tab_search, tab_results, tab_logs, tab_guide = st.tabs(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 with tab_search:
     c_up, c_fmt = st.columns([2, 1])
-
     with c_up:
         st.markdown("### 📁 Upload Input File")
         st.markdown("Excel (.xlsx) or CSV with **`URL`** and **`Keyword`** columns.")
-        uploaded = st.file_uploader("Drop file here", type=["xlsx", "xls", "csv"],
-                                    label_visibility="collapsed")
+        uploaded = st.file_uploader("",
+            type=["xlsx", "xls", "csv"], label_visibility="collapsed")
     with c_fmt:
-        st.markdown("### 📌 Required Columns")
+        st.markdown("### 📌 Required Format")
         st.markdown("""
 | Column | Example |
 |--------|---------|
 | `URL` | `https://…/file.pdf` |
-| `Keyword` | `51712160148` |
+| `Keyword` | `search term` |
 
-Multi: `EAN123|UPC456`
+Multi: `term1|term2|term3`
 """)
 
     if uploaded:
@@ -1002,12 +945,11 @@ Multi: `EAN123|UPC456`
 
             bad_cols = [c for c in ["URL", "Keyword"] if c not in idf.columns]
             if bad_cols:
-                st.error(f"❌ Missing columns: **{', '.join(bad_cols)}**. "
-                         f"Found: {idf.columns.tolist()}")
+                st.error(f"❌ Missing columns: **{', '.join(bad_cols)}**")
             else:
                 idf = idf.dropna(subset=["URL"]).reset_index(drop=True)
                 if len(idf) > SEARCH_LIMIT:
-                    st.warning(f"⚠️ Only first {SEARCH_LIMIT:,} rows will be processed.")
+                    st.warning(f"⚠️ Capped at {SEARCH_LIMIT:,} rows.")
                     idf = idf.head(SEARCH_LIMIT)
 
                 total_rows  = len(idf)
@@ -1019,7 +961,7 @@ Multi: `EAN123|UPC456`
                 with st.expander("🔎 Preview (first 10 rows)", expanded=False):
                     st.dataframe(idf.head(10), use_container_width=True)
 
-                st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                st.markdown("<hr class='d'>", unsafe_allow_html=True)
 
                 # ── Pre-Processing Summary ─────────────────────────
                 st.markdown("### 📋 Pre-Processing Summary")
@@ -1034,40 +976,48 @@ Multi: `EAN123|UPC456`
                     else:
                         _auto_desc = "Single Search (auto-detected)"
 
-                _cache_note = (f"✅ {dup_urls:,} duplicate URLs will reuse cached text"
-                               if dup_urls > 0 else "No duplicate URLs")
+                _cache_note = (
+                    f"✅ {dup_urls:,} duplicate URLs — text cached, downloaded once"
+                    if dup_urls > 0 else "No duplicate URLs detected"
+                )
 
                 st.markdown(f"""
 <div class="ppbox">
-  <div class="ppr"><span class="ppk">Total Rows</span><span class="ppv">{total_rows:,}</span></div>
-  <div class="ppr"><span class="ppk">Unique URLs</span><span class="ppv">{unique_urls:,}</span></div>
-  <div class="ppr"><span class="ppk">URL Cache Savings</span><span class="ppv">{_cache_note}</span></div>
-  <div class="ppr"><span class="ppk">Search Mode</span><span class="ppv">{_auto_desc}</span></div>
-  <div class="ppr"><span class="ppk">Match Logic</span><span class="ppv">{"Match ALL" if match_all else "Match ANY"}</span></div>
-  <div class="ppr"><span class="ppk">Case-Sensitive</span><span class="ppv">{"Yes" if case_sensitive else "No"}</span></div>
-  <div class="ppr"><span class="ppk">Workers / Timeout</span><span class="ppv">{workers} workers / {timeout}s</span></div>
+  <div class="ppr"><span class="ppk">Total Rows</span>
+    <span class="ppv">{total_rows:,}</span></div>
+  <div class="ppr"><span class="ppk">Unique URLs</span>
+    <span class="ppv">{unique_urls:,}</span></div>
+  <div class="ppr"><span class="ppk">URL Cache</span>
+    <span class="ppv">{_cache_note}</span></div>
+  <div class="ppr"><span class="ppk">Search Mode</span>
+    <span class="ppv">{_auto_desc}</span></div>
+  <div class="ppr"><span class="ppk">Match Logic</span>
+    <span class="ppv">{"Match ALL" if match_all else "Match ANY"}</span></div>
+  <div class="ppr"><span class="ppk">Case-Sensitive</span>
+    <span class="ppv">{"Yes" if case_sensitive else "No"}</span></div>
+  <div class="ppr"><span class="ppk">Workers / Timeout</span>
+    <span class="ppv">{workers} / {timeout}s</span></div>
 </div>
 """, unsafe_allow_html=True)
 
                 st.markdown("""
 <div class="info-note">
-ℹ️ Results are auto-saved every 100 rows to disk.
-If the page refreshes or your connection drops, use the
-<strong>Auto-Save / Recovery</strong> panel in the sidebar to download
-or restore partial results at any time.
+💾 Results are auto-saved every 100 rows.
+If the page refreshes or your connection drops, use
+<strong>Recovery</strong> in the sidebar to restore partial results.
 </div>
 """, unsafe_allow_html=True)
 
-                st.markdown("<hr class='div'>", unsafe_allow_html=True)
+                st.markdown("<hr class='d'>", unsafe_allow_html=True)
 
                 # ── Action Buttons ─────────────────────────────────
                 b1, b2, b3, _ = st.columns([2, 1, 1, 1])
                 with b1:
-                    start = st.button("🚀 Start Search", use_container_width=True,
-                                      type="primary",
+                    start = st.button("🚀 Start Search",
+                                      use_container_width=True, type="primary",
                                       disabled=st.session_state.running)
                 with b2:
-                    if st.button("⏸ Pause / Resume", use_container_width=True,
+                    if st.button("⏸ Pause/Resume", use_container_width=True,
                                  disabled=not st.session_state.running):
                         st.session_state.paused = not st.session_state.paused
                 with b3:
@@ -1083,22 +1033,19 @@ or restore partial results at any time.
                     st.session_state.results_df = None
                     st.session_state.log_lines  = []
                     st.session_state.error_log  = []
-                    st.session_state.job_stats  = {}
                     _clear_all_state()
 
-                    # Assign stable row IDs (Bug 1 fix)
                     idf = idf.copy()
                     idf["_row_id"] = range(len(idf))
-                    rows = idf.to_dict("records")
-                    total = len(rows)
-
-                    prog  = st.progress(0, text="Initializing…")
-                    mtrs  = st.empty()
-                    curl  = st.empty()
-                    lbox  = st.empty()
-                    results:   list[dict] = []
-                    done_n:    list[int]  = [0]
-                    start_t    = time.time()
+                    rows    = idf.to_dict("records")
+                    total   = len(rows)
+                    prog    = st.progress(0, text="Starting…")
+                    mtrs    = st.empty()
+                    curl    = st.empty()
+                    lbox    = st.empty()
+                    results: list[dict] = []
+                    done_n:  list[int]  = [0]
+                    start_t = time.time()
 
                     def _log(msg: str) -> None:
                         ts = datetime.now().strftime("%H:%M:%S")
@@ -1109,34 +1056,36 @@ or restore partial results at any time.
                     def _log_err(url_: str, status_: str) -> None:
                         st.session_state.error_log.append({
                             "Time": datetime.now().strftime("%H:%M:%S"),
-                            "URL": url_, "Issue": status_,
+                            "URL": url_, "Status": status_,
                         })
 
                     def _save(dicts: list[dict]) -> None:
                         if dicts:
-                            clean = _build_clean_df(dicts)
-                            st.session_state.results_df = clean
+                            st.session_state.results_df = _build_df(dicts)
                             _autosave(dicts, done_n[0], total)
 
-                    def _is_retry(r: dict) -> bool:
-                        return r.get("_raw_status", "") in _RETRY_STATUSES
+                    def _needs_retry(r: dict) -> bool:
+                        return r.get("_cat", "") in _RETRY_CATS
 
-                    def _run_pass(work: list[dict], label: str) -> tuple[list, list]:
+                    def _run_pass(work: list[dict],
+                                  label: str) -> tuple[list[dict], list[dict]]:
                         pass_res: list[dict] = []
                         pass_err: list[dict] = []
 
                         with ThreadPoolExecutor(max_workers=workers) as ex:
                             fmap: dict = {}
                             for r in work:
-                                while st.session_state.paused and st.session_state.running:
-                                    time.sleep(0.5)
+                                while (st.session_state.paused
+                                       and st.session_state.running):
+                                    time.sleep(0.4)
                                 if not st.session_state.running:
                                     break
                                 f = ex.submit(
                                     process_one,
                                     str(r.get("URL", "")),
                                     str(r.get("Keyword", "")),
-                                    _MODE, match_all, case_sensitive, timeout,
+                                    _MODE, match_all, case_sensitive,
+                                    timeout,
                                     int(r.get("_row_id", 0)),
                                     enable_mirror, enable_smart,
                                 )
@@ -1152,30 +1101,31 @@ or restore partial results at any time.
                                 except Exception as exc:
                                     src = fmap[future]
                                     res = {
-                                        "_row_id": int(src.get("_row_id", 0)),
-                                        "URL": str(src.get("URL", "")),
-                                        "Keyword": str(src.get("Keyword", "")),
+                                        "_row_id":    int(src.get("_row_id", 0)),
+                                        "URL":        str(src.get("URL", "")),
+                                        "Keyword":    str(src.get("Keyword", "")),
                                         "Search Mode": _MODE.capitalize(),
-                                        "Extraction Option": "",
-                                        "Result": S.NOT_FOUND,
+                                        "Keyword_Search_Status": S.FAILED,
                                         "Match Count": 0, "Snippet": "",
                                         "Matched Keywords": "",
                                         "Missing Keywords": "",
                                         "Notes": f"Exception: {exc}",
-                                        "_raw_status": S.CONNECTION_ERR,
+                                        "_cat": "connection",
                                     }
 
                                 done_n[0] += 1
-                                raw_s = res.get("_raw_status", "")
-                                icon  = ("✅" if raw_s == S.FOUND else
-                                         "⚠️" if raw_s == S.PARTIAL else
-                                         "❌" if raw_s == S.NOT_FOUND else "🔴")
+                                ks    = res.get("Keyword_Search_Status", "")
+                                icon  = ("✅" if ks == S.FOUND else
+                                         "❌" if ks == S.NOT_FOUND else
+                                         "🟡" if ks == S.SCANNED else
+                                         "🟣" if ks == S.CORRUPTED else "🔺")
                                 url_s = res["URL"][-55:] if len(res["URL"]) > 55 else res["URL"]
-                                _log(f"[{label}][{done_n[0]}/{total}] {icon} {raw_s[:20]:20s} …{url_s}")
+                                _log(f"[{label}][{done_n[0]}/{total}] "
+                                     f"{icon} {ks[:26]:26s} …{url_s}")
 
-                                if raw_s in _TECHNICAL_STATUSES:
+                                if _needs_retry(res):
                                     pass_err.append(fmap[future])
-                                    _log_err(res["URL"], raw_s)
+                                    _log_err(res["URL"], ks)
 
                                 pass_res.append(res)
 
@@ -1189,19 +1139,21 @@ or restore partial results at any time.
                                     el   = time.time() - start_t
                                     rate = done_n[0] / el if el else 0
                                     eta  = (total - done_n[0]) / rate if rate else 0
-                                    succ = sum(1 for r in pass_res if r.get("_raw_status") == S.FOUND)
+                                    found_n = sum(1 for r in pass_res
+                                                  if r.get("Keyword_Search_Status") == S.FOUND)
                                     prog.progress(pct,
-                                        text=f"[{label}] {done_n[0]:,}/{total:,} • {rate:.1f}/s • ETA {eta:.0f}s")
+                                        text=f"[{label}] {done_n[0]:,}/{total:,} "
+                                             f"• {rate:.1f}/s • ETA {eta:.0f}s")
                                     mtrs.markdown(
                                         f"⏱ **{el:.0f}s** &nbsp;|&nbsp; "
                                         f"⚡ **{rate:.1f}** URLs/s &nbsp;|&nbsp; "
-                                        f"✅ **{succ}** found &nbsp;|&nbsp; "
-                                        f"📊 **{done_n[0]:,}/{total:,}** done"
+                                        f"✅ **{found_n:,}** found &nbsp;|&nbsp; "
+                                        f"📊 **{done_n[0]:,}/{total:,}**"
                                     )
-                                    curl.markdown(f"**Processing:** `…{url_s}`")
+                                    curl.markdown(f"`…{url_s}`")
                                     lbox.markdown(
                                         '<div class="logbox">' +
-                                        "<br>".join(st.session_state.log_lines[-40:]) +
+                                        "<br>".join(st.session_state.log_lines[-35:]) +
                                         "</div>", unsafe_allow_html=True)
 
                         return pass_res, pass_err
@@ -1211,15 +1163,15 @@ or restore partial results at any time.
                     p1, p1_err = _run_pass(rows, "Pass 1")
                     results.extend(p1)
 
-                    # ── Pass 2 — retry failed rows ──────────────────
+                    # ── Pass 2 — retry network failures ────────────
                     if enable_retry and p1_err and st.session_state.running:
-                        _log(f"♻️ Pass 2 — retrying {len(p1_err):,} failed rows…")
-                        # Use row_id to safely remove only the specific failed rows
+                        _log(f"♻️ Pass 2 — {len(p1_err):,} failed rows…")
                         err_ids = {r.get("_row_id") for r in p1_err}
-                        results = [r for r in results if r.get("_row_id") not in err_ids]
+                        results = [r for r in results
+                                   if r.get("_row_id") not in err_ids]
                         total  += len(p1_err)
-                        _log("⏳ 15 s cooldown…")
-                        time.sleep(15)
+                        _log("⏳ 12s cooldown…")
+                        time.sleep(12)
                         p2, still = _run_pass(p1_err, "Pass 2")
                         results.extend(p2)
                         _log(f"{'✅ All resolved' if not still else f'⚠️ {len(still):,} still failed'} after Pass 2")
@@ -1230,16 +1182,6 @@ or restore partial results at any time.
                     if results:
                         _save(results)
                         el = time.time() - start_t
-                        # Store stats for Logs tab
-                        df_r = _build_clean_df(results)
-                        st.session_state.job_stats = {
-                            "total": len(df_r),
-                            "found": (df_r["Result"] == S.FOUND).sum(),
-                            "not_found": (df_r["Result"] == S.NOT_FOUND).sum(),
-                            "partial": (df_r["Result"] == S.PARTIAL).sum(),
-                            "scanned": (df_r["Result"] == S.NON_SEARCHABLE).sum(),
-                            "elapsed": el,
-                        }
                         prog.progress(1.0, text="✅ Search Complete!")
                         st.success(
                             f"✅ **{done_n[0]:,}** rows in **{el:.1f}s** "
@@ -1249,8 +1191,8 @@ or restore partial results at any time.
                         st.warning("No results collected.")
 
         except Exception as e:
-            st.error(f"❌ Failed to load file: {e}")
             import traceback
+            st.error(f"❌ {e}")
             st.session_state.log_lines.append(f"[ERROR] {traceback.format_exc()}")
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1261,54 +1203,54 @@ with tab_results:
     if df is None:
         st.info("🔍 Run a search to see results here.")
     else:
-        # Ensure clean columns present
-        for _c in _CLEAN_COLS:
-            if _c not in df.columns: df[_c] = ""
+        for c in _OUT_COLS:
+            if c not in df.columns: df[c] = ""
 
         t_r  = len(df)
-        f_r  = (df["Result"] == S.FOUND).sum()
-        nf_r = (df["Result"] == S.NOT_FOUND).sum()
-        p_r  = (df["Result"] == S.PARTIAL).sum()
-        sc_r = (df["Result"] == S.NON_SEARCHABLE).sum()
-        nt_r = df["Notes"].astype(str).str.strip().ne("").sum()
+        f_r  = (df["Keyword_Search_Status"] == S.FOUND).sum()
+        nf_r = (df["Keyword_Search_Status"] == S.NOT_FOUND).sum()
+        sc_r = (df["Keyword_Search_Status"] == S.SCANNED).sum()
+        co_r = (df["Keyword_Search_Status"] == S.CORRUPTED).sum()
+        fa_r = (df["Keyword_Search_Status"] == S.FAILED).sum()
 
         st.markdown("### 📊 Summary")
-        _stats_row(t_r, f_r, nf_r, p_r, sc_r, nt_r)
+        _stats_row(t_r, f_r, nf_r, sc_r, co_r, fa_r)
         st.markdown("---")
 
-        # ── Filters ───────────────────────────────────────────────
         fc1, fc2 = st.columns(2)
         with fc1:
-            s_opts = sorted(df["Result"].unique().tolist())
-            s_filt = st.multiselect("Filter by Result", s_opts, default=s_opts)
+            s_opts = sorted(df["Keyword_Search_Status"].dropna().unique().tolist())
+            s_filt = st.multiselect("Filter by Status", s_opts, default=s_opts)
         with fc2:
-            kw_filt = st.text_input("Filter by Keyword (contains)", "")
+            kw_filt = st.text_input("Filter by Keyword", "")
 
-        fdf = df[df["Result"].isin(s_filt)]
+        fdf = df[df["Keyword_Search_Status"].isin(s_filt)]
         if kw_filt:
-            fdf = fdf[fdf["Keyword"].astype(str).str.contains(kw_filt, case=False, na=False)]
+            fdf = fdf[fdf["Keyword"].astype(str).str.contains(
+                kw_filt, case=False, na=False)]
 
-        st.markdown(f"**Showing {len(fdf):,} of {t_r:,} rows**")
+        st.markdown(f"**{len(fdf):,} of {t_r:,} rows**")
 
-        disp = fdf[_CLEAN_COLS].copy()
+        disp = fdf[_OUT_COLS].copy()
         if len(disp) <= 5000:
             sfn = getattr(disp.style, "map", None) or disp.style.applymap
-            st.dataframe(sfn(_result_badge, subset=["Result"]),
-                         use_container_width=True, height=460)
+            st.dataframe(
+                sfn(_status_badge, subset=["Keyword_Search_Status"]),
+                use_container_width=True, height=460,
+            )
         else:
             st.dataframe(disp, use_container_width=True, height=460)
 
-        # ── Download ──────────────────────────────────────────────
         st.markdown("---")
-        st.markdown("### ⬇️ Download Results")
+        st.markdown("### ⬇️ Download")
         _ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
         _pex = (output_format == "Excel (.xlsx)")
         dc1, dc2 = st.columns(2)
         with dc1:
             try:
                 st.download_button(
-                    "📥 Excel (.xlsx) — 4 sheets",
-                    data=_to_excel(fdf[_CLEAN_COLS]),
+                    "📥 Excel (.xlsx) — 6 sheets",
+                    data=_to_excel(fdf[_OUT_COLS]),
                     file_name=f"keyword_search_{_ts}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
@@ -1319,19 +1261,18 @@ with tab_results:
         with dc2:
             st.download_button(
                 "📥 CSV",
-                data=_to_csv(fdf[_CLEAN_COLS]),
+                data=_to_csv(fdf[_OUT_COLS]),
                 file_name=f"keyword_search_{_ts}.csv",
                 mime="text/csv",
                 use_container_width=True,
                 type="primary" if not _pex else "secondary",
             )
 
-        # ── Distribution chart ─────────────────────────────────────
         st.markdown("---")
-        st.markdown("### 📈 Result Distribution")
-        cht = df["Result"].value_counts().reset_index()
-        cht.columns = ["Result", "Count"]
-        st.bar_chart(cht.set_index("Result"))
+        st.markdown("### 📈 Distribution")
+        cht = df["Keyword_Search_Status"].value_counts().reset_index()
+        cht.columns = ["Status", "Count"]
+        st.bar_chart(cht.set_index("Status"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TAB 3 — LOGS
@@ -1342,11 +1283,10 @@ with tab_logs:
     el = st.session_state.error_log
 
     if not ll:
-        st.info("No log entries yet.")
+        st.info("No logs yet. Run a search first.")
     else:
         lc1, lc2 = st.columns([3, 1])
-        with lc1:
-            st.markdown(f"**{len(ll):,} entries**")
+        with lc1: st.markdown(f"**{len(ll):,} entries**")
         with lc2:
             st.download_button("📥 Export Log",
                 data="\n".join(ll).encode("utf-8"),
@@ -1359,21 +1299,20 @@ with tab_logs:
 
     st.markdown("---")
     st.markdown("### ❌ Issue Breakdown")
-
     if not el:
-        st.success("✅ No issues." if ll else "Run a search first.")
+        st.success("✅ No issues recorded." if ll else "Run a search first.")
     else:
         edf = pd.DataFrame(el)
-        bd  = edf["Issue"].value_counts().reset_index()
-        bd.columns = ["Issue Type", "Count"]
+        bd  = edf["Status"].value_counts().reset_index()
+        bd.columns = ["Status", "Count"]
         ec1, ec2 = st.columns([1, 2])
         with ec1:
-            st.markdown(f"**{len(el):,} issues total**")
+            st.markdown(f"**{len(el):,} issues**")
             for _, r in bd.iterrows():
-                st.markdown(f"- **{r['Issue Type']}**: {r['Count']:,}")
+                st.markdown(f"- **{r['Status']}**: {r['Count']:,}")
         with ec2:
-            st.bar_chart(bd.set_index("Issue Type"))
-        with st.expander("📋 Issue Detail", expanded=False):
+            st.bar_chart(bd.set_index("Status"))
+        with st.expander("📋 Detail", expanded=False):
             st.dataframe(edf, use_container_width=True)
         st.download_button("📥 Export Issues (.csv)",
             data=edf.to_csv(index=False).encode("utf-8-sig"),
@@ -1392,93 +1331,77 @@ with tab_guide:
 | Step | Action |
 |------|--------|
 | 1 | Choose **Search Mode** in the sidebar |
-| 2 | Download a **Template** from the sidebar |
+| 2 | Download the **Template** from the sidebar |
 | 3 | Fill in `URL` and `Keyword` columns |
 | 4 | Upload the file on the **Search** tab |
 | 5 | Review the **Pre-Processing Summary** |
 | 6 | Click **🚀 Start Search** |
-| 7 | Watch live progress — Pause or Stop at any time |
+| 7 | Watch live progress — Pause or Stop any time |
 | 8 | Download results from the **Results** tab |
 
-> **If the page refreshes or your connection drops**, your progress is saved automatically.
-> Use the **Auto-Save / Recovery** panel in the sidebar to restore or download partial results.
+> If the page refreshes or your connection drops, use **Recovery** in the sidebar.
 
 ---
 
 ### 🔘 Search Modes
 
-| Mode | Keyword Format | When to Use |
-|------|---------------|-------------|
-| **Single Search** | `51712160148` | One keyword per row |
-| **Multi Search** | `EAN123|UPC456|GTIN789` | Multiple keywords per row |
-| **Table Search** | `8471.30|8471.41` | Numeric / code lookups |
+| Mode | Keyword Format | Logic |
+|------|---------------|-------|
+| **Single Search** | `keyword` | One keyword per row |
+| **Multi Search** | `kw1|kw2|kw3` | ANY or ALL matching |
+| **Table Search** | `code1|code2` | Numeric/code values |
 | **Auto Detect** | Any | App picks the right mode |
 
-**Match ANY** (default): Found if at least one keyword is present.
-**Match ALL**: Found only if every keyword matches; otherwise Partial Match.
-
 ---
 
-### 🚦 Result Values
+### 🚦 The 5 Result Statuses
 
-| Result | Meaning |
+| Status | Meaning |
 |--------|---------|
-| ✅ **{S.FOUND}** | Keyword found in the document |
-| ❌ **{S.NOT_FOUND}** | Document searched, keyword absent |
-| ⚠️ **{S.PARTIAL}** | Some keywords found (Multi + Match ALL) |
-| 🟡 **{S.NON_SEARCHABLE}** | Image PDF — no text layer to search |
-
-> Technical issues (connection errors, timeouts, SSL problems) are recorded in the **Notes** column
-> and are never shown in the main **Result** column. This keeps the output clean for non-technical users.
+| ✅ **{S.FOUND}** | Keyword was found in the document |
+| ❌ **{S.NOT_FOUND}** | Document was read, keyword is not present |
+| 🟡 **{S.SCANNED}** | Image/scanned PDF — no text layer |
+| 🟣 **{S.CORRUPTED}** | File is damaged or unreadable |
+| 🔺 **{S.FAILED}** | Could not download or access the document |
 
 ---
 
-### 📤 Output File Columns
+### 📤 Output Columns
 
 | Column | Description |
 |--------|-------------|
 | `URL` | Original URL |
 | `Keyword` | Keyword(s) as entered |
 | `Search Mode` | Single / Multi / Table / Auto |
-| `Result` | **Main result** — Found / Not Found / Partial Match / Non searchable |
-| `Match Count` | Total number of times the keyword appears in the document |
-| `Snippet` | ~100-character context around the first match |
+| `Keyword_Search_Status` | **Main result** — one of the 5 statuses above |
+| `Match Count` | Total occurrences found in the document |
+| `Snippet` | Context around the first match |
 | `Matched Keywords` | Which keywords were found (Multi mode) |
 | `Missing Keywords` | Which keywords were not found (Multi mode) |
-| `Notes` | Technical details for any issues — empty for normal results |
+| `Notes` | Extra detail for Failed rows only |
 
-> The Excel output has **4 sheets**: All Results · Found · Not Found and Partial · Errors and Issues.
+> Excel output has **6 sheets**: All Results + one sheet per status.
 
 ---
 
 ### ⚙️ Settings
 
-| Setting | Default | What it does |
+| Setting | Default | Description |
 |---------|---------|-------------|
-| **Concurrent Workers** | {DEFAULT_WORKERS} | Parallel downloads — keep 4–6 for z2data.com |
-| **Timeout per URL** | {DEFAULT_TIMEOUT}s | Max wait — increase for large/slow PDFs |
-| **Case-Sensitive** | OFF | OFF: `EAN123` matches `ean123` |
-| **Enable Retry System** | ON | Automatically retries failed URLs in a second pass |
-| **Enable Mirror Fallback** | ON | Tries `source1.z2data.com` if `source.z2data.com` fails |
-| **Enable Smart Error Detection** | ON | Detects "not found" HTML pages returned as 200 OK |
-
----
-
-### 🔄 Retry Logic
-
-- **Pass 1**: every URL — 3 attempts with exponential back-off
-- **Mirror fallback**: `source.z2data.com` ↔ `source1.z2data.com` (automatic)
-- **Path fallback**: `/web/` paths tried without the `/web/` segment
-- **15 s cooldown** before Pass 2
-- **Pass 2**: failed rows only — no re-processing of already-successful rows
+| **Workers** | {DEFAULT_WORKERS} | Parallel downloads. Reduce to 4 if many failures. |
+| **Timeout** | {DEFAULT_TIMEOUT}s | Max wait per URL. Raise for slow/large documents. |
+| **Case-Sensitive** | OFF | OFF: `ABC` matches `abc` |
+| **Retry Failed URLs** | ON | Re-tries failed downloads in a second pass |
+| **Mirror Fallback** | ON | Tries an alternate server path on failure |
+| **Smart Error Detection** | ON | Detects "not found" pages returned as 200 OK |
 
 ---
 
 ### ⚡ Performance Tips
 
-- **4–6 workers** for z2data.com to avoid blocking
-- **Timeout 20s** default; raise to 40s+ for large PDFs
-- **CSV** is faster than Excel for 10,000+ rows
-- Duplicate URLs (same URL, different keywords) are downloaded **only once** (cached)
-- Check the **Logs tab** for a breakdown of any issues after a run
+- **10 workers** is the default — good for most servers
+- Reduce to **4–6** if you see many Failed results
+- **CSV** is faster to export than Excel for large result sets
+- Duplicate URLs (same URL, different keywords) are downloaded **only once**
+- Check the **Logs tab** for a full breakdown after a run
 """)
