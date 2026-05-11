@@ -7,7 +7,8 @@ import streamlit as st
 import pandas as pd
 import io, os, re, time, random, threading, tempfile, json
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import gc
 from html.parser import HTMLParser
 
 import fitz
@@ -36,27 +37,31 @@ st.markdown("""
 <style>
 /* ── Adaptive color tokens ── */
 :root {
-    --bg-card:      #ffffff;
-    --bg-sidebar:   #f8f9fc;
-    --bg-log:       #f4f6fb;
-    --bg-info:      #eef4ff;
-    --border:       #d0d7e8;
-    --text-primary: #1a1d23;
-    --text-muted:   #6b7a99;
-    --accent:       #1a73e8;
-    --accent-soft:  #e8f0fe;
-    --success:      #1e7e34;
-    --success-bg:   #d4edda;
-    --warn-bg:      #fff3cd;
-    --warn-txt:     #856404;
-    --err-bg:       #f8d7da;
-    --err-txt:      #721c24;
-    --scan-bg:      #fff8e1;
-    --scan-txt:     #795548;
-    --fail-bg:      #fce4ec;
-    --fail-txt:     #880e4f;
+    /* Improved light theme — stronger contrast, real depth */
+    --bg-card:      #fcfcfd;
+    --bg-sidebar:   #f3f6fb;
+    --bg-log:       #eef2f9;
+    --bg-info:      #e8f0fe;
+    --border:       #bcc7d9;
+    --text-primary: #111827;
+    --text-muted:   #5b6475;
+    --accent:       #005fcc;
+    --accent-soft:  #dceeff;
+    --success:      #1a6e2e;
+    --success-bg:   #c6f0d2;
+    --warn-bg:      #fef3c7;
+    --warn-txt:     #7c5300;
+    --err-bg:       #fde8e8;
+    --err-txt:      #7b1a1a;
+    --scan-bg:      #fef9e7;
+    --scan-txt:     #6b4226;
+    --fail-bg:      #fce4f0;
+    --fail-txt:     #7a0a4a;
     --corrupt-bg:   #ede7f6;
-    --corrupt-txt:  #4527a0;
+    --corrupt-txt:  #3d1a8a;
+    /* Extra depth tokens for light mode */
+    --shadow-sm:    0 1px 3px rgba(0,0,0,.10), 0 1px 2px rgba(0,0,0,.06);
+    --shadow-md:    0 4px 6px rgba(0,0,0,.08), 0 2px 4px rgba(0,0,0,.05);
 }
 @media (prefers-color-scheme: dark) {
     :root {
@@ -102,7 +107,7 @@ section[data-testid="stSidebar"] {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    box-shadow: 0 2px 8px rgba(0,0,0,.07);
+    box-shadow: var(--shadow-md);
 }
 .hdr h1 {
     font-size: 1.65rem; font-weight: 800;
@@ -127,8 +132,10 @@ section[data-testid="stSidebar"] {
     border-radius: 10px;
     padding: 14px 16px;
     text-align: center;
-    box-shadow: 0 1px 4px rgba(0,0,0,.05);
+    box-shadow: var(--shadow-sm);
+    transition: box-shadow .15s;
 }
+.sc:hover { box-shadow: var(--shadow-md); }
 .sc-n { font-size: 1.75rem; font-weight: 800; line-height: 1; }
 .sc-l { font-size: 0.68rem; color: var(--text-muted); margin-top: 4px;
         text-transform: uppercase; letter-spacing: .5px; }
@@ -159,9 +166,11 @@ section[data-testid="stSidebar"] {
 .ppbox {
     background: var(--bg-card);
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
     padding: 15px 20px;
     margin: 10px 0;
+    box-shadow: var(--shadow-sm);
 }
 .ppr { display: flex; justify-content: space-between;
        padding: 3px 0; font-size: 0.86rem; }
@@ -254,6 +263,34 @@ _HTML_NFP = [
     "page cannot be found", "this page doesn", "sorry, we couldn",
 ]
 
+# ── PDF size + extraction limits ──────────────────────────────────
+MAX_PDF_MB        = 40
+MAX_PDF_PAGES     = 500
+MAX_TEXT_CHARS    = 3_000_000   # truncate extraction at 3M chars
+MIN_USEFUL_CHARS  = 150         # below this = corrupted stub
+
+# ── In-progress dedup cache ───────────────────────────────────────
+# Prevents the same URL being downloaded by multiple workers simultaneously.
+# Worker that arrives second WAITS for the first worker's future result.
+_inprog_lock    = threading.Lock()
+_inprog_futures: dict[str, object] = {}   # normalized_url → Future
+
+# ── URL normalizer ────────────────────────────────────────────────
+def _norm_url(url: str) -> str:
+    """Lowercase host, strip fragment, strip trailing spaces — for cache keys."""
+    try:
+        url = url.strip()
+        if "://" in url:
+            scheme, rest = url.split("://", 1)
+            if "/" in rest:
+                host, path = rest.split("/", 1)
+                url = f"{scheme}://{host.lower()}/{path}"
+            else:
+                url = f"{scheme}://{rest.lower()}"
+        return url.split("#")[0].rstrip("/")
+    except Exception:
+        return url.strip()
+
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 2 — Network layer
 # ═══════════════════════════════════════════════════════════════════
@@ -332,6 +369,7 @@ def _clear_all_state() -> None:
     with _cache_lock:   _url_cache.clear()
     with _block_lock:   _consec_fail.clear(); _blocked_til.clear()
     with _rate_lock:    _last_req.clear()
+    with _inprog_lock:  _inprog_futures.clear()
 
 
 def _get_alternate_urls(url: str) -> list[str]:
@@ -430,11 +468,27 @@ def _fetch(url: str, session_timeout: int,
 # SECTION 4 — Text extraction
 # ═══════════════════════════════════════════════════════════════════
 def _extract_pdf(data: bytes) -> tuple[str, str]:
+    """Extract text with size limits, explicit memory cleanup."""
+    # Size check before parsing
+    if len(data) > MAX_PDF_MB * 1024 * 1024:
+        return "", f"error:PDF too large ({len(data)//1024//1024}MB > {MAX_PDF_MB}MB)"
     try:
-        doc   = fitz.open(stream=data, filetype="pdf")
-        pages = [p.get_text("text") for p in doc]
+        doc = fitz.open(stream=data, filetype="pdf")
+        page_count = doc.page_count
+        if page_count > MAX_PDF_PAGES:
+            doc.close(); del doc
+            return "", f"error:Too many pages ({page_count} > {MAX_PDF_PAGES})"
+        parts = []
+        total_chars = 0
+        for page in doc:
+            t = page.get_text("text")
+            total_chars += len(t)
+            parts.append(t)
+            if total_chars >= MAX_TEXT_CHARS:
+                break   # truncate — we have enough to search
         doc.close()
-        text  = "\n".join(pages)
+        del doc
+        text = "\n".join(parts)[:MAX_TEXT_CHARS]
         return (text, "searchable") if text.strip() else ("", "scanned")
     except Exception as e:
         return "", f"error:{e}"
@@ -472,20 +526,53 @@ def _extract_html(data: bytes) -> tuple[str, str]:
 
 def _get_text_cached(url: str, content: bytes,
                      is_html: bool) -> tuple[str, str]:
-    """URL-level text cache — same document never extracted twice."""
+    """
+    URL-level text cache — same document never extracted twice.
+    Also deduplicates concurrent extraction of the same URL:
+    if worker A is already extracting url, worker B waits for A's result
+    instead of extracting again (in-progress dedup).
+    """
+    nurl = _norm_url(url)
+
+    # Fast path: already extracted
     with _cache_lock:
-        if url in _url_cache:
-            return _url_cache[url]
-    if is_html:
-        text, status = _extract_html(content)
-        if not text and "error:" not in status:
-            text, status = _extract_pdf(content)
-    else:
-        text, status = _extract_pdf(content)
-        if "error:" in status:
+        if nurl in _url_cache:
+            return _url_cache[nurl]
+
+    # In-progress dedup: register or wait
+    my_event = threading.Event()
+    with _inprog_lock:
+        if nurl in _inprog_futures:
+            waiter = _inprog_futures[nurl]
+        else:
+            _inprog_futures[nurl] = my_event
+            waiter = None
+
+    if waiter is not None:
+        # Another thread is extracting — wait up to 60 s then fall back
+        waiter.wait(timeout=60)
+        with _cache_lock:
+            if nurl in _url_cache:
+                return _url_cache[nurl]
+        # Fall through to extract ourselves if waiter never set
+
+    # We are the first — extract
+    try:
+        if is_html:
             text, status = _extract_html(content)
-    with _cache_lock:
-        _url_cache[url] = (text, status)
+            if not text and "error:" not in status:
+                text, status = _extract_pdf(content)
+        else:
+            text, status = _extract_pdf(content)
+            if "error:" in status:
+                text, status = _extract_html(content)
+    finally:
+        with _cache_lock:
+            _url_cache[nurl] = (text, status)
+        with _inprog_lock:
+            _inprog_futures.pop(nurl, None)
+        my_event.set()   # wake any waiters
+
     return text, status
 
 
@@ -516,10 +603,15 @@ def _parse_keywords(raw: str, mode: str) -> list[str]:
 
 
 def _count_keyword(text: str, keyword: str, case_sensitive: bool) -> int:
+    """Fast count — uses str.count for simple single-keyword, regex only when needed."""
     if not text or not keyword: return 0
-    flags = 0 if case_sensitive else re.IGNORECASE
-    try:    return len(re.findall(re.escape(keyword.strip()), text, flags))
-    except: return 0
+    kw = keyword.strip()
+    if not kw: return 0
+    # Fast path: plain substring count (much faster than re.findall on large text)
+    if not case_sensitive:
+        return text.lower().count(kw.lower())
+    else:
+        return text.count(kw)
 
 
 def _search_all(text: str, keywords: list[str], case_sensitive: bool,
@@ -541,19 +633,23 @@ def _search_all(text: str, keywords: list[str], case_sensitive: bool,
 
 
 def _best_snippet(text: str, keyword: str, ctx: int = 120) -> str:
+    """Build context snippet. Skips expensive scan on very large text."""
     if not text or not keyword: return ""
-    kw = str(keyword).lower(); tl = text.lower()
+    # For very large texts only scan the first 500k chars — keyword will be found there
+    scan_text = text[:500_000] if len(text) > 500_000 else text
+    kw = str(keyword).lower(); tl = scan_text.lower()
     positions, start, best, seen = [], 0, "", set()
     while True:
         i = tl.find(kw, start)
         if i == -1: break
         positions.append(i); start = i + 1
+        if len(positions) >= 10: break   # only need a few candidates
     for i in positions:
-        s = max(0, i - ctx); e = min(len(text), i + len(kw) + ctx)
-        raw = _ILLEGAL_RE.sub("", text[s:e].strip())
+        s = max(0, i - ctx); e = min(len(scan_text), i + len(kw) + ctx)
+        raw = _ILLEGAL_RE.sub("", scan_text[s:e].strip())
         if not raw or raw in seen: continue
         seen.add(raw)
-        cand = ("…" if s > 0 else "") + raw + ("…" if e < len(text) else "")
+        cand = ("…" if s > 0 else "") + raw + ("…" if e < len(scan_text) else "")
         if len(raw) > len(best.replace("…", "")): best = cand
     return best
 
@@ -609,13 +705,8 @@ def process_one(url: str, raw_keyword: str, search_mode: str,
 
     norm = _normalize(text)
 
-    # BUG 2 FIX: very short extracted text = corrupted/garbage file.
-    # Real documents have at least ~150 chars of useful text.
-    # Old/archived stubs return 200 OK but near-empty content.
-    # These would otherwise fall through to keyword search → "Not Found"
-    # even though the correct classification is "Corrupted".
-    _MIN_USEFUL_CHARS = 150
-    if len(norm.strip()) < _MIN_USEFUL_CHARS:
+    # Short extracted text = corrupted/garbage file stub
+    if len(norm.strip()) < MIN_USEFUL_CHARS:
         return done(Keyword_Search_Status=S.CORRUPTED, _cat="corrupted")
 
     if use_smart and _is_not_found_page(norm):
@@ -691,15 +782,33 @@ def _status_badge(val) -> str:
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 8 — Autosave / Recovery
 # ═══════════════════════════════════════════════════════════════════
+# Append-only autosave: never rewrite entire file — just append new rows.
+# Avoids O(n²) IO as the batch grows.
+_autosave_initialized = [False]
+
 def _autosave(result_dicts: list[dict], processed: int, total: int) -> None:
+    """Append new rows to autosave CSV. Much faster than full rewrite each time."""
     try:
         if result_dicts:
-            pd.DataFrame(result_dicts).to_csv(_AUTOSAVE_CSV, index=False)
+            df_batch = pd.DataFrame(result_dicts[-100:])  # only the latest 100
+            for c in _OUT_COLS:
+                if c not in df_batch.columns: df_batch[c] = ""
+            write_header = not _autosave_initialized[0] or not os.path.exists(_AUTOSAVE_CSV)
+            df_batch[_OUT_COLS].to_csv(
+                _AUTOSAVE_CSV,
+                mode="a",
+                header=write_header,
+                index=False,
+            )
+            _autosave_initialized[0] = True
         with open(_JOB_STATE_FILE, "w") as f:
             json.dump({"processed": processed, "total": total,
                        "saved_at": datetime.now().isoformat()}, f)
     except Exception:
         pass
+
+def _reset_autosave_state() -> None:
+    _autosave_initialized[0] = False
 
 
 def _load_autosave() -> tuple[pd.DataFrame | None, dict | None]:
@@ -1043,6 +1152,7 @@ If the page refreshes or your connection drops, use
                     st.session_state.log_lines  = []
                     st.session_state.error_log  = []
                     _clear_all_state()
+                    _reset_autosave_state()
 
                     idf = idf.copy()
                     idf["_row_id"] = range(len(idf))
@@ -1069,9 +1179,9 @@ If the page refreshes or your connection drops, use
                         })
 
                     def _save(dicts: list[dict]) -> None:
+                        """Build and assign results_df on main thread. Safe for Streamlit."""
                         if dicts:
                             st.session_state.results_df = _build_df(dicts)
-                            _autosave(dicts, done_n[0], total)
 
                     def _needs_retry(r: dict) -> bool:
                         return r.get("_cat", "") in _RETRY_CATS
@@ -1080,20 +1190,18 @@ If the page refreshes or your connection drops, use
                                   label: str) -> tuple[list[dict], list[dict]]:
                         pass_res:  list[dict] = []
                         pass_err:  list[dict] = []
-                        found_ctr: list[int]  = [0]   # incremental — no full scan
+                        found_ctr: list[int]  = [0]
 
-                        # FIX 2: submit + collect in one interleaved pass.
-                        # We cap in-flight futures to workers*2 so the main
-                        # thread never waits for a big backlog at the end.
-                        # The executor exits with cancel_futures=True so any
-                        # straggler beyond the timeout is discarded immediately
-                        # instead of blocking the shutdown.
-                        _in_flight: dict = {}
+                        _in_flight:    dict[object, dict]  = {}   # future → row
+                        _submit_times: dict[object, float] = {}   # future → submit time
                         _work_iter = iter(work)
                         _stopped   = False
+                        # Throttle UI updates — max once per 0.75s
+                        _last_ui   = [0.0]
+                        # Per-future hard deadline = submit_time + timeout + 10s buffer
+                        _HARD_DEADLINE = timeout + 10
 
                         def _submit_next():
-                            """Submit one task if work remains and not stopped."""
                             try:
                                 r = next(_work_iter)
                             except StopIteration:
@@ -1112,128 +1220,125 @@ If the page refreshes or your connection drops, use
                                 int(r.get("_row_id", 0)),
                                 enable_mirror, enable_smart,
                             )
-                            _in_flight[f] = r
+                            _in_flight[f]    = r
+                            _submit_times[f] = time.time()
                             return f
 
+                        def _collect_one(future, src_row) -> None:
+                            """Process one completed future into pass_res."""
+                            try:
+                                res = future.result(timeout=0)
+                            except Exception as exc:
+                                res = {
+                                    "_row_id":  int(src_row.get("_row_id", 0)),
+                                    "URL":      str(src_row.get("URL", "")),
+                                    "Keyword":  str(src_row.get("Keyword", "")),
+                                    "Search Mode": _MODE.capitalize(),
+                                    "Keyword_Search_Status": S.FAILED,
+                                    "Match Count": 0, "Snippet": "",
+                                    "Matched Keywords": "",
+                                    "Missing Keywords": "",
+                                    "Notes": f"Exception: {exc}",
+                                    "_cat": "connection",
+                                }
+                            done_n[0] += 1
+                            ks    = res.get("Keyword_Search_Status", "")
+                            icon  = ("✅" if ks == S.FOUND else
+                                     "❌" if ks == S.NOT_FOUND else
+                                     "🟡" if ks == S.SCANNED else
+                                     "🟣" if ks == S.CORRUPTED else "🔺")
+                            url_s = res["URL"][-55:] if len(res["URL"]) > 55 else res["URL"]
+                            _log(f"[{label}][{done_n[0]}/{total}] "
+                                 f"{icon} {ks[:26]:26s} …{url_s}")
+                            if _needs_retry(res):
+                                pass_err.append(src_row)
+                                _log_err(res["URL"], ks)
+                            pass_res.append(res)
+                            if ks == S.FOUND:
+                                found_ctr[0] += 1
+                            if done_n[0] % 100 == 0:
+                                _autosave(pass_res, done_n[0], total)
+                                _log(f"💾 Auto-saved checkpoint at {done_n[0]:,} rows")
+                            # Throttled UI update — max once per 0.75s
+                            now = time.time()
+                            if now - _last_ui[0] >= 0.75 or done_n[0] == total:
+                                _last_ui[0] = now
+                                pct  = min(done_n[0] / total, 1.0)
+                                el   = now - start_t
+                                rate = done_n[0] / el if el else 0
+                                eta  = (total - done_n[0]) / rate if rate else 0
+                                prog.progress(pct,
+                                    text=f"[{label}] {done_n[0]:,}/{total:,} "
+                                         f"• {rate:.1f}/s • ETA {eta:.0f}s")
+                                mtrs.markdown(
+                                    f"⏱ **{el:.0f}s** &nbsp;|&nbsp; "
+                                    f"⚡ **{rate:.1f}** URLs/s &nbsp;|&nbsp; "
+                                    f"✅ **{found_ctr[0]:,}** found &nbsp;|&nbsp; "
+                                    f"📊 **{done_n[0]:,}/{total:,}**"
+                                )
+                                curl.markdown(f"`…{url_s}`")
+                                lbox.markdown(
+                                    '<div class="logbox">' +
+                                    "<br>".join(st.session_state.log_lines[-35:]) +
+                                    "</div>", unsafe_allow_html=True)
+
                         with ThreadPoolExecutor(max_workers=workers) as ex:
-                            # Pre-fill the pool
+                            # Pre-fill pool
                             for _ in range(workers * 2):
                                 if _submit_next() is None:
                                     break
 
                             while _in_flight:
-                                # BUG 1 FIX: as_completed raises TimeoutError (not just
-                                # returning empty) when the timeout expires.
-                                # Catch it explicitly so it never reaches Streamlit.
-                                done_futures = []
-                                try:
-                                    for f in as_completed(
-                                        list(_in_flight.keys()), timeout=timeout + 5
-                                    ):
-                                        done_futures.append(f)
-                                        break   # one at a time for live UI
-                                except Exception:
-                                    # TimeoutError or any other error from as_completed
-                                    # → treat all remaining in-flight as straggler failures
-                                    done_futures = []
-
-                                if not done_futures:
-                                    # Timeout hit — mark stragglers as Failed and move on
-                                    _log(f"⚠️ {len(_in_flight)} straggler(s) timed out — marking Failed")
-                                    for f in list(_in_flight.keys()):
-                                        src = _in_flight.pop(f)
-                                        pass_res.append({
-                                            "_row_id": int(src.get("_row_id", 0)),
-                                            "URL":     str(src.get("URL", "")),
-                                            "Keyword": str(src.get("Keyword", "")),
-                                            "Search Mode": _MODE.capitalize(),
-                                            "Keyword_Search_Status": S.FAILED,
-                                            "Match Count": 0, "Snippet": "",
-                                            "Matched Keywords": "",
-                                            "Missing Keywords": "",
-                                            "Notes": "Straggler timeout",
-                                            "_cat": "timeout",
-                                        })
-                                        done_n[0] += 1
-                                        pass_err.append(src)
+                                if not st.session_state.running:
+                                    _log("⏹ Stopped by user.")
+                                    ex.shutdown(wait=False, cancel_futures=True)
+                                    _stopped = True
                                     break
 
-                                for future in done_futures:
-                                    src_row = _in_flight.pop(future, None)
-                                    if src_row is None:
-                                        continue
-
-                                    # Submit next task to keep pool full
-                                    _submit_next()
-
-                                    if not st.session_state.running:
-                                        _log("⏹ Stopped by user.")
-                                        ex.shutdown(wait=False, cancel_futures=True)
-                                        _in_flight.clear()
-                                        _stopped = True
-                                        break
-
-                                    try:
-                                        res = future.result(timeout=0)
-                                    except Exception as exc:
-                                        res = {
-                                            "_row_id":  int(src_row.get("_row_id", 0)),
-                                            "URL":      str(src_row.get("URL", "")),
-                                            "Keyword":  str(src_row.get("Keyword", "")),
-                                            "Search Mode": _MODE.capitalize(),
-                                            "Keyword_Search_Status": S.FAILED,
-                                            "Match Count": 0, "Snippet": "",
-                                            "Matched Keywords": "",
-                                            "Missing Keywords": "",
-                                            "Notes": f"Exception: {exc}",
-                                            "_cat": "connection",
-                                        }
-
+                                # ── Expire futures that have hit their hard deadline
+                                now = time.time()
+                                expired = [f for f, t in _submit_times.items()
+                                           if now - t > _HARD_DEADLINE
+                                           and f in _in_flight]
+                                for f in expired:
+                                    src_row = _in_flight.pop(f, None)
+                                    _submit_times.pop(f, None)
+                                    if src_row is None: continue
+                                    _log(f"⚠️ Hard deadline hit — {str(src_row.get('URL',''))[-45:]}")
+                                    pass_res.append({
+                                        "_row_id": int(src_row.get("_row_id", 0)),
+                                        "URL":     str(src_row.get("URL", "")),
+                                        "Keyword": str(src_row.get("Keyword", "")),
+                                        "Search Mode": _MODE.capitalize(),
+                                        "Keyword_Search_Status": S.FAILED,
+                                        "Match Count": 0, "Snippet": "",
+                                        "Matched Keywords": "", "Missing Keywords": "",
+                                        "Notes": "Per-future hard deadline exceeded",
+                                        "_cat": "timeout",
+                                    })
                                     done_n[0] += 1
-                                    ks    = res.get("Keyword_Search_Status", "")
-                                    icon  = ("✅" if ks == S.FOUND else
-                                             "❌" if ks == S.NOT_FOUND else
-                                             "🟡" if ks == S.SCANNED else
-                                             "🟣" if ks == S.CORRUPTED else "🔺")
-                                    url_s = res["URL"][-55:] if len(res["URL"]) > 55 else res["URL"]
-                                    _log(f"[{label}][{done_n[0]}/{total}] "
-                                         f"{icon} {ks[:26]:26s} …{url_s}")
+                                    pass_err.append(src_row)
+                                    _submit_next()   # fill freed slot
 
-                                    if _needs_retry(res):
-                                        pass_err.append(src_row)
-                                        _log_err(res["URL"], ks)
-
-                                    pass_res.append(res)
-                                    if ks == S.FOUND:
-                                        found_ctr[0] += 1
-
-                                    if done_n[0] % 100 == 0:
-                                        _save(results + pass_res)
-                                        _log(f"💾 Auto-saved {done_n[0]:,} rows")
-
-                                    _n = max(1, min(25, total // 60))
-                                    if done_n[0] % _n == 0 or done_n[0] == total:
-                                        pct  = min(done_n[0] / total, 1.0)
-                                        el   = time.time() - start_t
-                                        rate = done_n[0] / el if el else 0
-                                        eta  = (total - done_n[0]) / rate if rate else 0
-                                        prog.progress(pct,
-                                            text=f"[{label}] {done_n[0]:,}/{total:,} "
-                                                 f"• {rate:.1f}/s • ETA {eta:.0f}s")
-                                        mtrs.markdown(
-                                            f"⏱ **{el:.0f}s** &nbsp;|&nbsp; "
-                                            f"⚡ **{rate:.1f}** URLs/s &nbsp;|&nbsp; "
-                                            f"✅ **{found_ctr[0]:,}** found &nbsp;|&nbsp; "
-                                            f"📊 **{done_n[0]:,}/{total:,}**"
-                                        )
-                                        curl.markdown(f"`…{url_s}`")
-                                        lbox.markdown(
-                                            '<div class="logbox">' +
-                                            "<br>".join(st.session_state.log_lines[-35:]) +
-                                            "</div>", unsafe_allow_html=True)
-
-                                if _stopped:
+                                if not _in_flight:
                                     break
+
+                                # ── wait() never raises TimeoutError — safe replacement for as_completed(timeout=)
+                                try:
+                                    done_set, _ = wait(
+                                        list(_in_flight.keys()),
+                                        timeout=0.5,             # poll every 500ms
+                                        return_when=FIRST_COMPLETED,
+                                    )
+                                except Exception:
+                                    done_set = set()
+
+                                for future in done_set:
+                                    src_row = _in_flight.pop(future, None)
+                                    _submit_times.pop(future, None)
+                                    if src_row is None: continue
+                                    _collect_one(future, src_row)
+                                    _submit_next()   # keep pool full
 
                         return pass_res, pass_err
 
@@ -1260,22 +1365,23 @@ If the page refreshes or your connection drops, use
 
                     if results:
                         el = time.time() - start_t
-                        # Show success IMMEDIATELY — don't block on file write
+                        # Build final DataFrame on the main thread (safe for Streamlit).
+                        # _build_df is fast — it only reshapes dicts already in memory.
+                        # The incremental autosave already wrote every 100 rows to disk.
+                        st.session_state.results_df = _build_df(results)
+                        # Final state snapshot
+                        with open(_JOB_STATE_FILE, "w") as _f:
+                            import json as _j
+                            _j.dump({"processed": done_n[0], "total": total,
+                                     "saved_at": datetime.now().isoformat(),
+                                     "complete": True}, _f)
                         prog.progress(1.0, text="✅ Search Complete!")
                         st.success(
                             f"✅ **{done_n[0]:,}** rows in **{el:.1f}s** "
                             f"({done_n[0]/el:.1f} rows/s)"
                         )
-                        # FIX 3: final save in background thread so UI is
-                        # instantly responsive. The DataFrame is built and
-                        # CSV written without blocking the main thread.
-                        def _final_save_bg():
-                            try:
-                                _save(results)
-                            except Exception:
-                                pass
-                        import threading as _th
-                        _th.Thread(target=_final_save_bg, daemon=True).start()
+                        # Trigger periodic gc to release PyMuPDF memory
+                        gc.collect()
                     else:
                         st.warning("No results collected.")
 
