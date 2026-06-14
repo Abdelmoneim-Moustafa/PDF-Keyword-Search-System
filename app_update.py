@@ -258,8 +258,8 @@ _OUT_COLS = [
 
 _HTML_NFP = [
     "page not found", "404 not found", "404 error", "file not found",
-    "resource not found", "does not exist", "error 404", "no results found",
-    "page unavailable", "could not be found", "not available",
+    "resource not found", "error 404", "no results found",
+    "page unavailable", "could not be found",
     "page cannot be found", "this page doesn", "sorry, we couldn",
 ]
 
@@ -304,7 +304,9 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
-    "Referer":         "https://www.google.com/",
+    # Referer must point at the z2data source host — z2data.com silently
+    # drops/blocks requests that arrive with a generic external referer.
+    "Referer":         "https://source.z2data.com/",
 }
 
 _rate_lock  = threading.Lock()
@@ -373,18 +375,18 @@ def _clear_all_state() -> None:
 
 
 def _get_alternate_urls(url: str) -> list[str]:
-    """Swap between mirror hosts + strip /web/ path segment."""
+    """Swap between mirror hosts + strip /web/ path segment.
+
+    z2data.com serves the same files from both source.z2data.com and
+    source1.z2data.com — swap between the two specifically (a generic
+    'append 1 to the whole host' produces an invalid domain such as
+    'source.z2data.com1').
+    """
     alts: list[str] = []
-    parts = url.split("//", 1)
-    if len(parts) == 2:
-        host_path = parts[1]
-        host      = host_path.split("/")[0]
-        # Generic mirror swap: host ↔ host with "1" appended/removed
-        if host.endswith("1") and not host.endswith("11"):
-            alt_host = host[:-1]
-        else:
-            alt_host = host + "1"
-        alts.append(url.replace(f"//{host}", f"//{alt_host}", 1))
+    if "//source1.z2data.com" in url:
+        alts.append(url.replace("//source1.z2data.com", "//source.z2data.com", 1))
+    elif "//source.z2data.com" in url:
+        alts.append(url.replace("//source.z2data.com", "//source1.z2data.com", 1))
     if "/web/" in url:
         stripped = url.replace("/web/", "/", 1)
         alts.append(stripped)
@@ -578,6 +580,10 @@ def _get_text_cached(url: str, content: bytes,
 
 def _is_not_found_page(text: str) -> bool:
     if not text: return False
+    # Real "not found" responses are short. Long documents (datasheets, etc.)
+    # are legitimate content even if a stray phrase matches, so only apply
+    # this heuristic to short documents that actually look like error pages.
+    if len(text) > 1500: return False
     return any(p in text[:1000].lower() for p in _HTML_NFP)
 
 # ═══════════════════════════════════════════════════════════════════
