@@ -414,9 +414,9 @@ def _download_one(url: str, timeout: int,
         code = resp.status_code
         if code == 429:
             time.sleep(4 + random.random() * 4)
-            return None, "blocked"
+            return None, "429"          # FIX: distinguish rate-limit from 403
         if code == 403:
-            return None, "blocked"
+            return None, "403"          # FIX: 403 → try mirror, not hard-stop
         if code in (404, 410):
             return None, "404"
         return None, f"http_{code}"
@@ -432,7 +432,10 @@ def _download_one(url: str, timeout: int,
 
 def _fetch(url: str, session_timeout: int,
            use_mirror: bool = True) -> tuple[bytes | None, str]:
-    """Primary + alternates, 3 attempts each. Permanent 404 exits immediately."""
+    """Primary + alternates, 3 attempts each. Permanent 404 exits immediately.
+    403 on primary -> tries all mirror candidates before giving up.
+    429 -> short cooldown then continues to next candidate.
+    """
     candidates = [url] + (_get_alternate_urls(url) if use_mirror else [])
     last_cat = "timeout"
     conn_err = False
@@ -455,9 +458,12 @@ def _fetch(url: str, session_timeout: int,
                 return content, "ok"
 
             last_cat = cat
-            if cat == "404":     return None, "404"
-            if cat == "blocked": break              # no retry on rate-limit
-            if cat == "ssl":     break              # SSL won't self-fix on retry
+            if cat == "404":  return None, "404"   # permanent - exit now
+            if cat == "ssl":  break                 # SSL won't fix on retry
+            if cat == "403":  break                 # try next mirror candidate
+            if cat == "429":                        # rate-limited - pause, try mirror
+                time.sleep(3 + random.random() * 3)
+                break
             if cat in ("timeout", "connection"):
                 conn_err = True
 
@@ -579,12 +585,16 @@ def _get_text_cached(url: str, content: bytes,
 
 
 def _is_not_found_page(text: str) -> bool:
+    # FIX: Only fire on genuine HTML error pages.
+    # Real datasheets/PDFs always extract to much longer text, so raise the
+    # threshold to 3000 chars. Also require at least 2 distinct NFP signals
+    # to avoid false-positives on short z2data PDF cover pages that contain
+    # innocuous phrases like "not available" but are legitimate documents.
     if not text: return False
-    # Real "not found" responses are short. Long documents (datasheets, etc.)
-    # are legitimate content even if a stray phrase matches, so only apply
-    # this heuristic to short documents that actually look like error pages.
-    if len(text) > 1500: return False
-    return any(p in text[:1000].lower() for p in _HTML_NFP)
+    if len(text) > 3000: return False   # genuine documents are never this short
+    sample = text[:1500].lower()
+    hits = sum(1 for p in _HTML_NFP if p in sample)
+    return hits >= 2                    # require 2+ distinct NFP phrases
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 5 — Normalization + keyword search
@@ -696,9 +706,18 @@ def process_one(url: str, raw_keyword: str, search_mode: str,
     content, dl_cat = _fetch(url, session_timeout, use_mirror=use_mirror)
 
     if content is None:
-        # Map all download failures → S.FAILED
-        return done(Keyword_Search_Status=S.FAILED,
-                    Notes=dl_cat, _cat=dl_cat)
+        # FIX: Map raw download category codes to human-readable notes
+        _cat_note = {
+            "404":       "URL Not Found (404)",
+            "403":       "Access Denied (403) on all mirror candidates",
+            "429":       "Rate Limited (429) on all mirror candidates",
+            "ssl":       "SSL/TLS Error",
+            "timeout":   "Timeout",
+            "connection":"Connection Error",
+            "corrupted": "File too small / corrupted",
+        }
+        note = _cat_note.get(dl_cat, dl_cat or "Download failed")
+        return done(Keyword_Search_Status=S.FAILED, Notes=note, _cat=dl_cat)
 
     # ── Extract ──────────────────────────────────────────────────
     text, ext_status = _get_text_cached(url, content, is_html)
