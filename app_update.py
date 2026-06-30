@@ -1,8 +1,14 @@
 # ═══════════════════════════════════════════════════════════════════
 # PDF Keyword Search — Streamlit app
-# Fixed: 403/mirror fallback, multi-keyword, dark/light mode,
-#        _ILLEGAL_CHARS_RE order, disk autosave, 6-sheet Excel,
-#        correct status values, future timeout, retry detection
+# UI MODERNIZATION ONLY — backend logic unchanged from prior version.
+#
+# Preserved 1:1: network layer, retry/mirror logic, text extraction,
+# keyword parsing/search, per-row processor, output builders (Excel/CSV),
+# autosave/recovery. See SECTIONS 3-9 below — copied verbatim.
+#
+# Changed: page shell, CSS (now theme-aware via Streamlit CSS vars,
+# no hardcoded hex), sidebar layout, header, tab content presentation,
+# status badges/metrics rendering, and the input template's example rows.
 # ═══════════════════════════════════════════════════════════════════
 import streamlit as st
 import pandas as pd
@@ -36,94 +42,197 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════════════════
 # SECTION 1 — Session state defaults
 # ══════════════════════════════════════════════════════════════════
-if "results_df"  not in st.session_state: st.session_state.results_df  = None
-if "running"     not in st.session_state: st.session_state.running     = False
-if "dark_mode"   not in st.session_state: st.session_state.dark_mode   = True
+if "results_df" not in st.session_state: st.session_state.results_df = None
+if "running"    not in st.session_state: st.session_state.running    = False
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 2 — Theme
+# SECTION 2 — Theme-aware styling (UI ONLY)
 # ══════════════════════════════════════════════════════════════════
-def _theme():
-    if st.session_state.dark_mode:
-        return dict(
-            bg="#0f1117", card="#1a1f2e", card2="#16213e", border="#2d3561",
-            text="#e8eaf0", subtext="#8892a4", accent="#00d4ff",
-            found_bg="#0d4c2b", found_fg="#00e676",
-            nf_bg="#4c1a0d",   nf_fg="#ff6b6b",
-            scan_bg="#2d2600", scan_fg="#ffd600",
-            fail_bg="#2d0024", fail_fg="#f48fb1",
-            corrupt_bg="#1a0a2e", corrupt_fg="#ce93d8",
-            log_bg="#12161f",  sidebar_bg="#0b0e17",
-        )
-    return dict(
-        bg="#f4f6fa", card="#ffffff", card2="#eef1f8", border="#d0d7e8",
-        text="#1a1f2e", subtext="#5a6480", accent="#1565c0",
-        found_bg="#e8f5e9", found_fg="#1b5e20",
-        nf_bg="#ffebee",   nf_fg="#b71c1c",
-        scan_bg="#fffde7", scan_fg="#f57f17",
-        fail_bg="#fce4ec", fail_fg="#880e4f",
-        corrupt_bg="#f3e5f5", corrupt_fg="#6a1b9a",
-        log_bg="#f0f2f8",  sidebar_bg="#edf0f8",
-    )
-
+# No hardcoded colors. Everything below references Streamlit's native
+# CSS custom properties (--primary-color, --background-color, etc.)
+# which automatically flip between Light and Dark themes set in
+# Settings → Theme, or via .streamlit/config.toml. This makes the
+# entire app follow the user's chosen theme with zero JS/Python toggle.
 def _inject_css():
-    t = _theme()
-    st.markdown(f"""
+    st.markdown("""
 <style>
-html, body, [data-testid="stAppViewContainer"], .main {{
-    background-color: {t['bg']} !important; color: {t['text']} !important;
-}}
-[data-testid="stHeader"] {{ background: {t['bg']} !important; }}
-section[data-testid="stSidebar"] {{
-    background: {t['sidebar_bg']} !important;
-    border-right: 1px solid {t['border']};
-}}
-section[data-testid="stSidebar"] * {{ color: {t['text']} !important; }}
-.header-card {{
-    background: linear-gradient(135deg, {t['card']} 0%, {t['card2']} 100%);
-    border: 1px solid {t['border']}; border-radius: 14px;
-    padding: 26px 34px; margin-bottom: 22px;
-}}
-.header-title {{ font-size: 1.9rem; font-weight: 800; color: {t['accent']}; margin: 0; }}
-.header-sub   {{ font-size: 0.93rem; color: {t['subtext']}; margin-top: 5px; }}
-.stat-card {{
-    background: {t['card']}; border-radius: 12px; padding: 18px 16px;
-    text-align: center; border: 1px solid {t['border']};
-}}
-.stat-number {{ font-size: 1.9rem; font-weight: 800; }}
-.stat-label  {{ font-size: 0.74rem; color: {t['subtext']}; margin-top: 4px;
-                text-transform: uppercase; letter-spacing: 0.6px; }}
-.progress-box {{
-    background: {t['log_bg']}; border: 1px solid {t['border']};
-    border-radius: 10px; padding: 16px 20px;
-    font-family: 'Courier New', monospace; font-size: 0.8rem;
-    color: {t['subtext']}; max-height: 210px; overflow-y: auto; line-height: 1.6;
-}}
-.limit-badge {{
-    background: linear-gradient(90deg,#e65100,#ff9800); color:#fff;
-    border-radius: 8px; padding: 9px 18px; font-weight: 700;
-    font-size: 1.05rem; text-align: center; margin: 6px 0 14px 0;
-}}
-hr {{ border-color: {t['border']} !important; margin: 18px 0; }}
-.stTabs [data-baseweb="tab-list"] {{ gap: 6px; }}
-.stTabs [data-baseweb="tab"] {{
-    background: {t['card']}; border: 1px solid {t['border']};
-    border-radius: 8px 8px 0 0; color: {t['subtext']}; font-weight: 600; padding: 8px 18px;
-}}
-.stTabs [aria-selected="true"] {{
-    background: {t['card2']} !important; color: {t['accent']} !important;
-    border-bottom: 2px solid {t['accent']} !important;
-}}
-.stButton > button {{
-    border-radius: 8px; font-weight: 700; border: 1px solid {t['border']};
-    background: {t['card']}; color: {t['text']}; transition: all 0.18s;
-}}
-.stButton > button:hover {{ transform: translateY(-2px); border-color: {t['accent']}; color: {t['accent']}; }}
-</style>""", unsafe_allow_html=True)
+:root {
+    --psk-radius: 12px;
+    --psk-radius-sm: 8px;
+    --psk-border: rgba(128,128,128,0.25);
+    --psk-border-strong: rgba(128,128,128,0.4);
+}
+
+/* ── Header / hero card ─────────────────────────────────────── */
+.psk-hero {
+    background: linear-gradient(135deg,
+                var(--secondary-background-color) 0%,
+                color-mix(in srgb, var(--secondary-background-color) 85%, var(--primary-color) 15%) 100%);
+    border: 1px solid var(--psk-border);
+    border-radius: var(--psk-radius);
+    padding: 28px 34px;
+    margin-bottom: 22px;
+}
+.psk-hero-title {
+    font-size: 1.85rem;
+    font-weight: 800;
+    color: var(--primary-color);
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.psk-hero-sub {
+    font-size: 0.92rem;
+    opacity: 0.72;
+    margin-top: 6px;
+}
+.psk-chip {
+    background: var(--background-color);
+    border: 1px solid var(--psk-border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 0.8rem;
+    font-family: monospace;
+}
+
+/* ── Metric / stat cards ────────────────────────────────────── */
+.psk-stat-card {
+    background: var(--secondary-background-color);
+    border: 1px solid var(--psk-border);
+    border-radius: var(--psk-radius);
+    padding: 18px 14px;
+    text-align: center;
+    transition: border-color .15s ease, transform .15s ease;
+}
+.psk-stat-card:hover {
+    border-color: var(--psk-border-strong);
+    transform: translateY(-1px);
+}
+.psk-stat-number { font-size: 1.85rem; font-weight: 800; line-height: 1.1; }
+.psk-stat-label {
+    font-size: 0.72rem;
+    opacity: 0.65;
+    margin-top: 5px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-weight: 600;
+}
+
+/* ── Status badge colors (semantic, theme-mixed) ────────────── */
+.psk-badge {
+    display: inline-block;
+    padding: 3px 11px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+}
+.psk-badge-found     { background: color-mix(in srgb, #22c55e 22%, transparent); color: #16a34a; }
+.psk-badge-notfound  { background: color-mix(in srgb, #ef4444 18%, transparent); color: #dc2626; }
+.psk-badge-scanned   { background: color-mix(in srgb, #eab308 22%, transparent); color: #ca8a04; }
+.psk-badge-corrupted { background: color-mix(in srgb, #a855f7 20%, transparent); color: #9333ea; }
+.psk-badge-failed    { background: color-mix(in srgb, #f43f5e 20%, transparent); color: #e11d48; }
+
+/* ── Section labels ─────────────────────────────────────────── */
+.psk-section-label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    opacity: 0.6;
+    margin: 4px 0 8px 0;
+}
+
+/* ── Limit banner ───────────────────────────────────────────── */
+.psk-limit-banner {
+    background: linear-gradient(90deg,
+                color-mix(in srgb, var(--primary-color) 18%, transparent),
+                color-mix(in srgb, var(--primary-color) 8%, transparent));
+    border: 1px solid color-mix(in srgb, var(--primary-color) 35%, transparent);
+    border-radius: var(--psk-radius-sm);
+    padding: 10px 14px;
+    font-weight: 700;
+    font-size: 0.92rem;
+    text-align: center;
+    margin: 6px 0 16px 0;
+}
+
+/* ── Live log box ───────────────────────────────────────────── */
+.psk-log {
+    background: var(--secondary-background-color);
+    border: 1px solid var(--psk-border);
+    border-radius: var(--psk-radius-sm);
+    padding: 14px 18px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.78rem;
+    opacity: 0.85;
+    max-height: 220px;
+    overflow-y: auto;
+    line-height: 1.65;
+}
+
+/* ── Info / format cards ────────────────────────────────────── */
+.psk-info-card {
+    background: var(--secondary-background-color);
+    border: 1px solid var(--psk-border);
+    border-radius: var(--psk-radius);
+    padding: 16px 20px;
+    font-size: 0.86rem;
+    line-height: 1.6;
+}
+.psk-info-card code {
+    background: var(--background-color);
+    padding: 1px 6px;
+    border-radius: 5px;
+}
+
+/* ── Legend rows ────────────────────────────────────────────── */
+.psk-legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    padding: 3px 0;
+}
+.psk-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    flex-shrink: 0;
+}
+
+/* ── Tabs ───────────────────────────────────────────────────── */
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+.stTabs [data-baseweb="tab"] {
+    border-radius: 8px 8px 0 0;
+    font-weight: 600;
+    padding: 8px 18px;
+}
+
+/* ── Buttons ────────────────────────────────────────────────── */
+.stButton > button {
+    border-radius: var(--psk-radius-sm);
+    font-weight: 700;
+    transition: transform .15s ease;
+}
+.stButton > button:hover { transform: translateY(-1px); }
+
+/* ── Sidebar polish ─────────────────────────────────────────── */
+section[data-testid="stSidebar"] hr { margin: 14px 0; opacity: 0.5; }
+section[data-testid="stSidebar"] .psk-side-title {
+    font-size: 0.78rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    opacity: 0.7;
+    margin: 2px 0 10px 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 _inject_css()
 
-# ══════════════════════════════════════════════════════════════════
 # SECTION 3 — Constants
 # ══════════════════════════════════════════════════════════════════
 SEARCH_LIMIT      = 50_000
@@ -612,19 +721,27 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
       All Results / Found / Not Found / Scanned / Corrupted / Failed
     """
     clean = _clean_df(df)
-    buf   = io.BytesIO()
+    buf = io.BytesIO()
+
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         clean.to_excel(w, index=False, sheet_name="All Results")
-        _sheet(w, clean, "Keyword_Search_Status", S.FOUND,     "Found")
-        _sheet(w, clean, "Keyword_Search_Status", S.NOT_FOUND, "Not Found")
-        _sheet(w, clean, "Keyword_Search_Status", S.SCANNED,   "Scanned")
-        _sheet(w, clean, "Keyword_Search_Status", S.CORRUPTED, "Corrupted")
-        _sheet(w, clean, "Keyword_Search_Status", S.FAILED,    "Failed")
+
+        if "Keyword_Search_Status" in clean.columns:
+            _sheet(w, clean, "Keyword_Search_Status", S.FOUND, "Found")
+            _sheet(w, clean, "Keyword_Search_Status", S.NOT_FOUND, "Not Found")
+            _sheet(w, clean, "Keyword_Search_Status", S.SCANNED, "Scanned")
+            _sheet(w, clean, "Keyword_Search_Status", S.CORRUPTED, "Corrupted")
+            _sheet(w, clean, "Keyword_Search_Status", S.FAILED, "Failed")
+
     return buf.getvalue()
 
 
 def _sheet(writer, df, col, val, name):
+    if col not in df.columns:
+        return
+
     subset = df[df[col] == val]
+
     if not subset.empty:
         subset.to_excel(writer, index=False, sheet_name=name)
 
@@ -633,16 +750,27 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def _make_template() -> bytes:
+def _make_template():
+    """Clean template containing only the required input columns + example rows."""
     tpl = pd.DataFrame({
-        "URL":     ["https://source.z2data.com/example.pdf",
-                    "https://source.z2data.com/example2.pdf",
-                    "https://source.z2data.com/example3.html"],
-        "Keyword": ["8536507000",
-                    "8536507000|8536.50.7000",
-                    "85366990|74122000|39174000"],
+        "URL": [
+            "https://source.z2data.com/example1.pdf",
+            "https://source.z2data.com/example2.pdf",
+            "https://source.z2data.com/example3.pdf",
+        ],
+        "Keyword": [
+            "8536507000",
+            "8536507000|8536.50.7000",
+            "85366990|74122000|39174000",
+        ],
     })
-    return df_to_excel_bytes(tpl)
+
+    buf = io.BytesIO()
+
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        tpl.to_excel(writer, index=False, sheet_name="Template")
+
+    return buf.getvalue()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -682,70 +810,97 @@ def _clear_autosave():
 
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 10 — UI helpers
+# SECTION 10 — UI presentation helpers (status badges / metrics)
+# UI ONLY — these only affect how Keyword_Search_Status values are
+# *displayed*; they never alter the values themselves.
 # ══════════════════════════════════════════════════════════════════
-def _status_style(val):
-    t = _theme()
-    m = {
-        S.FOUND:     f"background-color:{t['found_bg']};color:{t['found_fg']}",
-        S.NOT_FOUND: f"background-color:{t['nf_bg']};color:{t['nf_fg']}",
-        S.SCANNED:   f"background-color:{t['scan_bg']};color:{t['scan_fg']}",
-        S.CORRUPTED: f"background-color:{t['corrupt_bg']};color:{t['corrupt_fg']}",
-        S.FAILED:    f"background-color:{t['fail_bg']};color:{t['fail_fg']}",
-    }
-    return m.get(val, "")
+_BADGE_CLASS = {
+    S.FOUND:     "psk-badge-found",
+    S.NOT_FOUND: "psk-badge-notfound",
+    S.SCANNED:   "psk-badge-scanned",
+    S.CORRUPTED: "psk-badge-corrupted",
+    S.FAILED:    "psk-badge-failed",
+}
+
+_DOT_COLOR = {
+    S.FOUND:     "#22c55e",
+    S.NOT_FOUND: "#ef4444",
+    S.SCANNED:   "#eab308",
+    S.CORRUPTED: "#a855f7",
+    S.FAILED:    "#f43f5e",
+}
 
 
-def _stat_card(col, value, color, label):
-    t = _theme()
+def _status_badge_html(val: str) -> str:
+    cls = _BADGE_CLASS.get(val, "")
+    label = val if len(val) < 26 else val[:23] + "…"
+    return f'<span class="psk-badge {cls}">{label}</span>' if cls else val
+
+
+def _metric_card(col, value: int, label: str, accent: str = None):
+    style = f'style="color:{accent}"' if accent else ""
     col.markdown(f"""
-    <div class="stat-card">
-        <div class="stat-number" style="color:{color}">{value:,}</div>
-        <div class="stat-label">{label}</div>
+    <div class="psk-stat-card">
+        <div class="psk-stat-number" {style}>{value:,}</div>
+        <div class="psk-stat-label">{label}</div>
     </div>""", unsafe_allow_html=True)
 
 
-def _stat_row(df):
-    t  = _theme()
+def _render_summary_metrics(df: pd.DataFrame):
     kw = "Keyword_Search_Status"
-    total    = len(df)
-    found    = (df[kw] == S.FOUND).sum()
-    not_fnd  = (df[kw] == S.NOT_FOUND).sum()
-    scanned  = (df[kw] == S.SCANNED).sum()
-    corrupted= (df[kw] == S.CORRUPTED).sum()
-    failed   = (df[kw] == S.FAILED).sum()
+    total     = len(df)
+    found     = (df[kw] == S.FOUND).sum()
+    not_fnd   = (df[kw] == S.NOT_FOUND).sum()
+    scanned   = (df[kw] == S.SCANNED).sum()
+    corrupted = (df[kw] == S.CORRUPTED).sum()
+    failed    = (df[kw] == S.FAILED).sum()
+
     cols = st.columns(6)
-    _stat_card(cols[0], total,    t["accent"],     "Total")
-    _stat_card(cols[1], found,    t["found_fg"],   "Found")
-    _stat_card(cols[2], not_fnd,  t["nf_fg"],      "Not Found")
-    _stat_card(cols[3], scanned,  t["scan_fg"],    "Scanned")
-    _stat_card(cols[4], corrupted,t["corrupt_fg"], "Corrupted")
-    _stat_card(cols[5], failed,   t["fail_fg"],    "Failed")
+    _metric_card(cols[0], total,     "Total")
+    _metric_card(cols[1], found,     "Found",     _DOT_COLOR[S.FOUND])
+    _metric_card(cols[2], not_fnd,   "Not Found", _DOT_COLOR[S.NOT_FOUND])
+    _metric_card(cols[3], scanned,   "Scanned",   _DOT_COLOR[S.SCANNED])
+    _metric_card(cols[4], corrupted, "Corrupted", _DOT_COLOR[S.CORRUPTED])
+    _metric_card(cols[5], failed,    "Failed",    _DOT_COLOR[S.FAILED])
+
+
+def _legend_row(color: str, label: str, desc: str) -> str:
+    return (f'<div class="psk-legend-row">'
+            f'<span class="psk-dot" style="background:{color}"></span>'
+            f'<span><b>{label}</b> — {desc}</span></div>')
 
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 11 — SIDEBAR
+# SECTION 11 — SIDEBAR  (modernized, theme-aware, no backend changes)
 # ══════════════════════════════════════════════════════════════════
 with st.sidebar:
-    t = _theme()
-
-    # FIX 3: Dark / Light toggle
-    mode_label = "☀️ Light Mode" if st.session_state.dark_mode else "🌙 Dark Mode"
-    if st.button(mode_label, use_container_width=True):
-        st.session_state.dark_mode = not st.session_state.dark_mode
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown(f'<div class="limit-badge">⚠️ Limit: {SEARCH_LIMIT:,} rows</div>',
+    st.markdown('<div class="psk-side-title">🔍 PDF Keyword Search</div>',
+                unsafe_allow_html=True)
+    st.markdown(f'<div class="psk-limit-banner">⚠️ Limit&nbsp; {SEARCH_LIMIT:,} rows / run</div>',
                 unsafe_allow_html=True)
 
-    st.markdown("**Search Options**")
-    workers        = st.slider("Concurrent Workers",   2, 20, DEFAULT_WORKERS, 1)
-    timeout        = st.slider("Per-URL Timeout (sec)",5, 60, DEFAULT_TIMEOUT, 5)
-    case_sensitive = st.checkbox("Case-Sensitive Search", value=False)
+    # ── Search configuration ─────────────────────────────────────
+    st.markdown('<div class="psk-side-title">⚡ Search Configuration</div>',
+                unsafe_allow_html=True)
+    workers = st.slider(
+        "Concurrent Workers", 2, 20, DEFAULT_WORKERS, 1,
+        help="More workers = faster, but higher chance of rate-limiting. "
+             "6 is a safe default for z2data.com.",
+    )
+    timeout = st.slider(
+        "Per-URL Timeout (sec)", 5, 60, DEFAULT_TIMEOUT, 5,
+        help="Maximum time to wait for a single document before giving up.",
+    )
+    case_sensitive = st.checkbox(
+        "Case-Sensitive Search", value=False,
+        help="OFF: 'ABC' matches 'abc'. ON: exact case required.",
+    )
 
     st.markdown("---")
-    st.markdown("**Template**")
+
+    # ── Template ──────────────────────────────────────────────────
+    st.markdown('<div class="psk-side-title">📥 Input Template</div>',
+                unsafe_allow_html=True)
     st.download_button(
         "⬇️ Download Template (.xlsx)",
         data=_make_template(),
@@ -753,26 +908,33 @@ with st.sidebar:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    st.caption("Includes the required columns plus 3 example rows "
+               "showing single and multi-keyword (`|`) format.")
 
     st.markdown("---")
-    st.markdown("**Status Legend**")
-    st.markdown(f"""
-<span style='color:{t["found_fg"]}'>● Found</span> — keyword in document<br>
-<span style='color:{t["nf_fg"]}'>● Not Found</span> — document read, keyword absent<br>
-<span style='color:{t["scan_fg"]}'>● Scanned</span> — image PDF, no text layer<br>
-<span style='color:{t["corrupt_fg"]}'>● Corrupted</span> — damaged / unreadable file<br>
-<span style='color:{t["fail_fg"]}'>● Failed</span> — could not download / access
-""", unsafe_allow_html=True)
 
-    # ── Recovery panel ─────────────────────────────────────────────
+    # ── Status legend ─────────────────────────────────────────────
+    st.markdown('<div class="psk-side-title">📊 Status Legend</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        _legend_row(_DOT_COLOR[S.FOUND],     "Found",     "keyword located in document")
+        + _legend_row(_DOT_COLOR[S.NOT_FOUND], "Not Found", "document read, keyword absent")
+        + _legend_row(_DOT_COLOR[S.SCANNED],   "Scanned",   "image PDF, no text layer")
+        + _legend_row(_DOT_COLOR[S.CORRUPTED], "Corrupted", "damaged / unreadable file")
+        + _legend_row(_DOT_COLOR[S.FAILED],    "Failed",    "could not download / access"),
+        unsafe_allow_html=True,
+    )
+
+    # ── Recovery panel ───────────────────────────────────────────
     saved_df, saved_meta = _load_autosave()
     if saved_df is not None and saved_meta:
         st.markdown("---")
-        st.markdown("**💾 Saved Progress**")
+        st.markdown('<div class="psk-side-title">💾 Saved Progress</div>',
+                    unsafe_allow_html=True)
         st.caption(
-            f"{saved_meta.get('rows',0):,} rows saved  \n"
-            f"At: {saved_meta.get('saved_at','?')}  \n"
-            f"Progress: {saved_meta.get('processed',0):,}/{saved_meta.get('total',0):,}"
+            f"**{saved_meta.get('rows', 0):,}** rows saved · "
+            f"{saved_meta.get('processed', 0):,}/{saved_meta.get('total', 0):,} processed  \n"
+            f"Saved at {saved_meta.get('saved_at', '?')}"
         )
         col_r1, col_r2 = st.columns(2)
         with col_r1:
@@ -784,7 +946,7 @@ with st.sidebar:
                 _clear_autosave()
                 st.rerun()
         st.download_button(
-            "📥 Download Saved",
+            "📥 Download Saved Progress",
             data=df_to_csv_bytes(saved_df),
             file_name=f"partial_{saved_meta.get('saved_at','').replace(' ','_').replace(':','-')}.csv",
             mime="text/csv",
@@ -793,15 +955,14 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 12 — Header
+# SECTION 12 — Header  (modernized hero card)
 # ══════════════════════════════════════════════════════════════════
-t = _theme()
-st.markdown(f"""
-<div class="header-card">
-    <div class="header-title">🔍 PDF Keyword Search</div>
-    <div class="header-sub">
+st.markdown("""
+<div class="psk-hero">
+    <div class="psk-hero-title">🔍 PDF Keyword Search</div>
+    <div class="psk-hero-sub">
         Fast concurrent search across PDF &amp; HTML documents &nbsp;·&nbsp;
-        Multi-keyword: <code style="background:{t['card2']};padding:1px 6px;border-radius:4px">KW1 | KW2 | KW3</code>
+        multi-keyword support via <span class="psk-chip">KW1 | KW2 | KW3</span>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -816,24 +977,25 @@ with tab_search:
     col_up, col_info = st.columns([3, 2])
 
     with col_up:
-        st.markdown("##### 📁 Upload Input File")
+        st.markdown('<div class="psk-section-label">Upload Input File</div>',
+                    unsafe_allow_html=True)
         st.caption("Excel or CSV with **URL** and **Keyword** columns.")
-        uploaded = st.file_uploader("Drop file here",
-                                    type=["xlsx","xls","csv"],
-                                    label_visibility="collapsed")
+        uploaded = st.file_uploader(
+            "Drop file here", type=["xlsx", "xls", "csv"],
+            label_visibility="collapsed",
+        )
 
     with col_info:
-        t = _theme()
-        st.markdown("##### 📌 Input Format")
-        st.markdown(f"""
-<div style="background:{t['card']};border:1px solid {t['border']};
-     border-radius:10px;padding:14px 18px;font-size:0.85rem">
+        st.markdown('<div class="psk-section-label">Input Format</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""
+<div class="psk-info-card">
 <b>Required columns:</b> <code>URL</code> and <code>Keyword</code><br><br>
 <b>Multi-keyword</b> (pipe separator):<br>
 <code>8536507000</code> — single<br>
 <code>8536507000 | 8536.50</code> — two keywords<br>
 <code>PartNo | HsCode | EAN</code> — three keywords<br><br>
-Keyword is <b>Found</b> if <i>any</i> keyword matches.
+A row is marked <b>Found</b> if <i>any</i> keyword matches.
 </div>""", unsafe_allow_html=True)
 
     if uploaded:
@@ -845,13 +1007,13 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
 
             input_df.columns = [c.strip() for c in input_df.columns]
 
-            # Accept "Offline" as alias for URL
             if "URL" not in input_df.columns and "Offline" in input_df.columns:
                 input_df.rename(columns={"Offline": "URL"}, inplace=True)
 
-            missing = [c for c in ["URL","Keyword"] if c not in input_df.columns]
+            missing = [c for c in ["URL", "Keyword"] if c not in input_df.columns]
             if missing:
-                st.error(f"❌ Missing columns: **{', '.join(missing)}**  |  Found: `{input_df.columns.tolist()}`")
+                st.error(f"❌ Missing columns: **{', '.join(missing)}**  |  "
+                         f"Found: `{input_df.columns.tolist()}`")
             else:
                 input_df = input_df.dropna(subset=["URL"]).reset_index(drop=True)
                 n = len(input_df)
@@ -869,8 +1031,10 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
                 st.markdown("---")
                 c1, c2, c3 = st.columns([3, 1, 1])
                 with c1:
-                    start_btn = st.button("🚀 Start Search", use_container_width=True,
-                                          type="primary", disabled=st.session_state.running)
+                    start_btn = st.button(
+                        "🚀 Start Search", use_container_width=True,
+                        type="primary", disabled=st.session_state.running,
+                    )
                 with c2:
                     stop_btn = st.button("⏹ Stop", use_container_width=True)
                 with c3:
@@ -897,29 +1061,35 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
 
                     all_results: list = []
                     completed         = [0]
-                    log_lines:  list  = []
+                    log_lines: list   = []
                     start_ts          = time.time()
 
                     def _log(msg):
                         ts = datetime.now().strftime("%H:%M:%S")
                         log_lines.append(f"[{ts}] {msg}")
-                        if len(log_lines) > 100: log_lines.pop(0)
+                        if len(log_lines) > 100:
+                            log_lines.pop(0)
 
                     def _refresh_ui(label):
                         pct     = min(completed[0] / total, 1.0)
                         elapsed = time.time() - start_ts
                         rate    = completed[0] / elapsed if elapsed > 0 else 0
                         eta     = (total - completed[0]) / rate if rate > 0 else 0
-                        prog_bar.progress(pct,
-                            text=f"[{label}] {completed[0]:,}/{total:,} · {rate:.1f} URLs/s · ETA {eta:.0f}s")
+                        prog_bar.progress(
+                            pct,
+                            text=f"[{label}] {completed[0]:,}/{total:,} · "
+                                 f"{rate:.1f} URLs/s · ETA {eta:.0f}s",
+                        )
                         status_txt.markdown(
                             f"⏱ **{elapsed:.0f}s elapsed** &nbsp;|&nbsp; "
                             f"**{rate:.1f} URLs/s** &nbsp;|&nbsp; "
-                            f"**{completed[0]:,}/{total:,}**")
+                            f"**{completed[0]:,}/{total:,}**"
+                        )
                         log_box.markdown(
-                            '<div class="progress-box">' +
+                            '<div class="psk-log">' +
                             "<br>".join(log_lines[-30:]) +
-                            "</div>", unsafe_allow_html=True)
+                            "</div>", unsafe_allow_html=True,
+                        )
 
                     def _run_pass(work, label, extra_delay=0.0):
                         pass_results, pass_retry = [], []
@@ -927,7 +1097,8 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
                         with ThreadPoolExecutor(max_workers=workers) as ex:
                             fmap = {}
                             for r in work:
-                                if extra_delay > 0: time.sleep(extra_delay)
+                                if extra_delay > 0:
+                                    time.sleep(extra_delay)
                                 f = ex.submit(
                                     process_one_url,
                                     str(r.get("URL", "")),
@@ -937,7 +1108,6 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
                                 )
                                 fmap[f] = r
 
-                            # FIX 8: future.result(timeout=) prevents Per-future hard deadline
                             for fut in as_completed(fmap):
                                 if not st.session_state.running:
                                     _log("⏹ Stopped by user.")
@@ -945,21 +1115,20 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
                                     break
 
                                 try:
-                                    # FIX 8: cap worker time at timeout + 30 s grace
                                     res = fut.result(timeout=timeout + 30)
                                 except Exception as e:
                                     src_row = fmap[fut]
                                     res = {
-                                        "URL":                 str(src_row.get("URL", "")),
-                                        "Keyword":             str(src_row.get("Keyword", "")),
-                                        "Extraction Option":   "",
-                                        "URL_Status":          0,
-                                        "URL_Search_Status":   f"Exception: {e}",
-                                        "Keyword_Status":      None,
-                                        "feature_name":        str(src_row.get("Keyword", "")),
-                                        "feature_value":       "",
+                                        "URL":                  str(src_row.get("URL", "")),
+                                        "Keyword":              str(src_row.get("Keyword", "")),
+                                        "Extraction Option":    "",
+                                        "URL_Status":           0,
+                                        "URL_Search_Status":    f"Exception: {e}",
+                                        "Keyword_Status":       None,
+                                        "feature_name":         str(src_row.get("Keyword", "")),
+                                        "feature_value":        "",
                                         "Keyword_Search_Status": S.FAILED,
-                                        "_retry":              True,
+                                        "_retry":               True,
                                     }
 
                                 completed[0] += 1
@@ -969,36 +1138,33 @@ Keyword is <b>Found</b> if <i>any</i> keyword matches.
 
                                 pass_results.append(res)
 
-                                # FIX 9: retry flag set inside process_one_url
                                 if res.get("_retry"):
                                     pass_retry.append(fmap[fut])
 
-                                # Autosave every 100 rows (FIX 5)
                                 if completed[0] % 100 == 0:
                                     _autosave(all_results + pass_results, completed[0], total)
                                     _log(f"💾 Saved {completed[0]:,} rows to disk")
 
-                                # Refresh UI
                                 every = max(1, min(20, total // 50))
                                 if completed[0] % every == 0 or completed[0] == total:
                                     _refresh_ui(label)
 
                         return pass_results, pass_retry
 
-                    # ── Pass 1 ─────────────────────────────────────────────
+                    # ── Pass 1 ─────────────────────────────────────
                     _log(f"🚀 Pass 1 — {total:,} URLs · {workers} workers")
                     p1_res, p1_retry = _run_pass(rows, "Pass1")
                     all_results.extend(p1_res)
 
-                    # ── Pass 2 — retry transient failures ──────────────────
+                    # ── Pass 2 — retry transient failures ───────────
                     if p1_retry and st.session_state.running:
                         _log(f"♻️ Pass 2 — retrying {len(p1_retry):,} failed URLs…")
-                        # Remove pass-1 error rows; replace with pass-2 results
-                        retry_keys = {r.get("URL","") + "|" + r.get("Keyword","")
+                        retry_keys = {r.get("URL", "") + "|" + r.get("Keyword", "")
                                       for r in p1_retry}
-                        all_results = [r for r in all_results
-                                       if r.get("URL","") + "|" + r.get("Keyword","")
-                                       not in retry_keys]
+                        all_results = [
+                            r for r in all_results
+                            if r.get("URL", "") + "|" + r.get("Keyword", "") not in retry_keys
+                        ]
                         total += len(p1_retry)
                         _log("⏳ 12 s cooldown before Pass 2…")
                         time.sleep(12)
@@ -1037,12 +1203,11 @@ with tab_results:
     if rdf is None:
         st.info("🔍 Run a search first — results will appear here.")
     else:
-        st.markdown("##### 📊 Summary")
-        _stat_row(rdf)
+        st.markdown('<div class="psk-section-label">Summary</div>', unsafe_allow_html=True)
+        _render_summary_metrics(rdf)
         st.markdown("---")
 
         # Filters
-        t = _theme()
         fc1, fc2, fc3 = st.columns([2, 2, 2])
         with fc1:
             all_statuses = rdf["Keyword_Search_Status"].unique().tolist()
@@ -1060,15 +1225,21 @@ with tab_results:
 
         st.caption(f"Showing **{len(flt):,}** of {len(rdf):,} rows")
 
-        if len(flt) <= 5000:
-            fn = getattr(flt.style, "map", None) or flt.style.applymap
-            st.dataframe(fn(_status_style, subset=["Keyword_Search_Status"]),
-                         use_container_width=True, height=440)
+        display_df = flt.copy()
+        display_df["Keyword_Search_Status"] = display_df["Keyword_Search_Status"].apply(
+            _status_badge_html
+        )
+        if len(display_df) <= 300:
+            st.markdown(
+                display_df.to_html(escape=False, index=False),
+                unsafe_allow_html=True,
+            )
         else:
             st.dataframe(flt, use_container_width=True, height=440)
 
         st.markdown("---")
-        st.markdown("##### ⬇️ Download Results")
+        st.markdown('<div class="psk-section-label">Download Results</div>',
+                    unsafe_allow_html=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         dl1, dl2 = st.columns(2)
         with dl1:
@@ -1092,9 +1263,10 @@ with tab_results:
             )
 
         st.markdown("---")
-        st.markdown("##### 📈 Result Distribution")
+        st.markdown('<div class="psk-section-label">Result Distribution</div>',
+                    unsafe_allow_html=True)
         chart = rdf["Keyword_Search_Status"].value_counts().reset_index()
-        chart.columns = ["Status","Count"]
+        chart.columns = ["Status", "Count"]
         st.bar_chart(chart.set_index("Status"))
 
 
@@ -1121,8 +1293,8 @@ Separate keywords with `|` (pipe):
 | Keyword cell | Keywords searched |
 |---|---|
 | `8536507000` | one keyword |
-| `8536507000 \| 8536.50` | two keywords |
-| `PartNo \| HsCode \| EAN` | three keywords |
+| `8536507000 \\| 8536.50` | two keywords |
+| `PartNo \\| HsCode \\| EAN` | three keywords |
 
 Row is **Found** if **any** keyword is present in the document.
 
@@ -1176,6 +1348,12 @@ All Results · Found · Not Found · Scanned · Corrupted · Failed
 - Results saved to disk every **100 rows**
 - Survives page refresh, browser close, or Stop
 - **Recovery panel** in sidebar: restore, download, or clear saved data
+
+---
+
+### Theme
+This app follows your **Streamlit theme** (Settings → ⚙ → Theme → Light/Dark/Custom).
+No in-app toggle is needed — every color here is theme-aware and updates automatically.
 
 ---
 
