@@ -279,8 +279,7 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection":      "keep-alive",
-    # Required — z2data silently drops connections without Referer
-    "Referer":         "https://source.z2data.com/",
+    # Referer is set per-request (see _download_one) so it matches each domain
 }
 
 _CONNECT_TIMEOUT  = 15   # seconds for TCP handshake
@@ -352,9 +351,16 @@ def _clear_network_state():
 def _get_alternate_urls(url: str) -> list:
     """
     Return alternate mirror URLs to try after a primary failure.
+    Only generates alternates for known z2data CDN hosts — other domains
+    (Siemens, Mouser, Digikey, etc.) have no known mirrors so we return []
+    and avoid making bad requests to wrong hosts.
     z2data has two CDN hosts: source.z2data.com and source1.z2data.com.
-    Also strips /web/ prefix for old archived URLs.
+    Also strips /web/ prefix for old archived z2data URLs.
     """
+    # Only apply mirror logic to z2data URLs
+    if "z2data.com" not in url:
+        return []
+
     alts = []
     if "//source1.z2data.com" in url:
         alts.append(url.replace("//source1.z2data.com", "//source.z2data.com", 1))
@@ -389,9 +395,17 @@ def _download_one(url: str, timeout: int, fresh: bool = False):
     _wait_if_blocked(host)
     _rate_limit(host)
     session = _get_session(fresh=fresh)
+    # Set Referer dynamically: use the URL's own origin so the server sees a
+    # same-origin request — required by z2data and most product portals.
+    try:
+        parts = url.split("/")
+        origin = "/".join(parts[:3]) + "/"  # e.g. https://sieportal.siemens.com/
+    except Exception:
+        origin = "https://source.z2data.com/"
     try:
         resp = session.get(url, timeout=(_CONNECT_TIMEOUT, timeout),
-                           stream=False, allow_redirects=True)
+                           stream=False, allow_redirects=True,
+                           headers={"Referer": origin})
         if resp.status_code == 200:
             _record_success(host)
             return resp.content, ""
@@ -515,18 +529,57 @@ def _extract_html(data: bytes):
         return "", f"error:{e}"
 
 
+def _sniff_content_type(content: bytes) -> str:
+    """
+    Detect whether content is PDF or HTML by inspecting the actual bytes —
+    not the URL extension, which is unreliable for product portals and web
+    apps (e.g. sieportal.siemens.com returns HTML at extensionless URLs).
+    Returns 'pdf' | 'html'.
+    """
+    sig = content[:64].lstrip()
+    if sig.startswith(b"%PDF"):
+        return "pdf"
+    sig_lower = sig.lower()
+    if any(sig_lower.startswith(t) for t in
+           (b"<!doc", b"<html", b"<head", b"<body", b"<?xml")):
+        return "html"
+    sample = content[:512].lower()
+    if b"<html" in sample or b"<!doctype" in sample:
+        return "html"
+    # Default: if mostly printable ASCII, treat as HTML
+    printable = sum(1 for b in content[:256] if 0x20 <= b <= 0x7e or b in (9, 10, 13))
+    if len(content) > 0 and printable / min(256, len(content)) > 0.85:
+        return "html"
+    return "pdf"
+
+
 def _extract(content: bytes, is_html: bool):
-    """Try primary extractor then fallback to the other."""
-    if is_html:
-        text, status = _extract_html(content)
-        if not text and "error:" not in status:
-            text, status = _extract_pdf(content)
+    """
+    Extract text — always sniffs actual content bytes first.
+    The is_html hint (from URL extension) is only a fallback when byte-sniffing
+    is ambiguous. Always tries both extractors and returns the one with more text.
+    """
+    detected = _sniff_content_type(content)
+
+    if detected == "pdf":
+        text_pdf, status_pdf = _extract_pdf(content)
+        if text_pdf.strip():
+            return text_pdf, status_pdf
+        # Could be an HTML redirect/error page served with 200
+        text_html, status_html = _extract_html(content)
+        if text_html.strip():
+            return text_html, "searchable"
+        return text_pdf, status_pdf
     else:
-        text, status = _extract_pdf(content)
-        if "error:" in status:
-            text2, status2 = _extract_html(content)
-            if text2: text, status = text2, status2
-    return text, status
+        # detected html (or url hint says html)
+        text_html, status_html = _extract_html(content)
+        if text_html.strip():
+            return text_html, "searchable"
+        # Still nothing — try PDF in case content-type was wrong
+        text_pdf, status_pdf = _extract_pdf(content)
+        if text_pdf.strip():
+            return text_pdf, status_pdf
+        return text_html, status_html
 
 
 # URL-level text cache — same document never extracted twice
@@ -622,8 +675,12 @@ def process_one_url(url: str, raw_keyword: str,
         return done(URL_Status=0, URL_Search_Status="Invalid URL",
                     Keyword_Search_Status=S.FAILED, _retry=False)
 
-    is_html = url.lower().split("?")[0].endswith((".html", ".htm"))
-    base["Extraction Option"] = "HTML" if is_html else "PDF"
+    # ── URL-extension hint (used only as tiebreaker by _extract) ──
+    # NOTE: Do NOT rely on this for detection — product portals like
+    # sieportal.siemens.com serve HTML at URLs with no extension at all.
+    # Actual detection is done by _sniff_content_type() inside _extract().
+    _url_ext_hint = url.lower().split("?")[0]
+    is_html_hint  = _url_ext_hint.endswith((".html", ".htm"))
 
     # ── Download (FIX 1: mirrors tried on 403) ────────────────────
     content, dl_cat = _fetch(url, session_timeout, use_mirror=True)
@@ -642,6 +699,11 @@ def process_one_url(url: str, raw_keyword: str,
         retry = dl_cat in ("timeout", "connection", "429", "corrupted")
         return done(URL_Status=0, URL_Search_Status=note,
                     Keyword_Search_Status=S.FAILED, Notes=note, _retry=retry)
+
+    # ── Detect actual content type from bytes (not URL extension) ─
+    detected_type = _sniff_content_type(content)
+    is_html = detected_type == "html" or is_html_hint
+    base["Extraction Option"] = "HTML" if is_html else "PDF"
 
     # ── Text extraction ────────────────────────────────────────────
     text, ext_status = _get_text(url, content, is_html)
@@ -777,17 +839,28 @@ def _make_template():
 # SECTION 9 — Disk autosave / recovery
 # ══════════════════════════════════════════════════════════════════
 def _autosave(result_dicts: list, processed: int, total: int):
-    """FIX 5: Save partial results to disk so they survive a crash/refresh."""
+    """FIX 5: Save partial results to disk so they survive a crash/refresh.
+    Writes are atomic (temp file + os.replace) so a crash or power loss
+    mid-write can never leave a half-written / corrupted autosave file.
+    """
     try:
         df = _build_df(result_dicts)
-        df.to_csv(_AUTOSAVE_FILE, index=False, encoding="utf-8-sig")
+        tmp_csv  = _AUTOSAVE_FILE + ".tmp"
+        tmp_meta = _AUTOSAVE_META + ".tmp"
+
+        df.to_csv(tmp_csv, index=False, encoding="utf-8-sig")
         meta = {"processed": processed, "total": total,
                 "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "rows": len(df)}
-        with open(_AUTOSAVE_META, "w") as f:
+        with open(tmp_meta, "w") as f:
             json.dump(meta, f)
+
+        # Atomic on POSIX and Windows (os.replace overwrites the target)
+        os.replace(tmp_csv, _AUTOSAVE_FILE)
+        os.replace(tmp_meta, _AUTOSAVE_META)
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _load_autosave():
@@ -1093,86 +1166,116 @@ A row is marked <b>Found</b> if <i>any</i> keyword matches.
 
                     def _run_pass(work, label, extra_delay=0.0):
                         pass_results, pass_retry = [], []
+                        last_save_time = time.time()
+                        SAVE_EVERY_SECS = 20  # time-based safety net for slow/stalled connections
 
-                        with ThreadPoolExecutor(max_workers=workers) as ex:
-                            fmap = {}
-                            for r in work:
-                                if extra_delay > 0:
-                                    time.sleep(extra_delay)
-                                f = ex.submit(
-                                    process_one_url,
-                                    str(r.get("URL", "")),
-                                    str(r.get("Keyword", "")),
-                                    case_sensitive,
-                                    timeout,
-                                )
-                                fmap[f] = r
+                        try:
+                            with ThreadPoolExecutor(max_workers=workers) as ex:
+                                fmap = {}
+                                for r in work:
+                                    if extra_delay > 0:
+                                        time.sleep(extra_delay)
+                                    f = ex.submit(
+                                        process_one_url,
+                                        str(r.get("URL", "")),
+                                        str(r.get("Keyword", "")),
+                                        case_sensitive,
+                                        timeout,
+                                    )
+                                    fmap[f] = r
 
-                            for fut in as_completed(fmap):
-                                if not st.session_state.running:
-                                    _log("⏹ Stopped by user.")
-                                    ex.shutdown(wait=False, cancel_futures=True)
-                                    break
+                                for fut in as_completed(fmap):
+                                    if not st.session_state.running:
+                                        _log("⏹ Stopped by user.")
+                                        _autosave(all_results + pass_results, completed[0], total)
+                                        ex.shutdown(wait=False, cancel_futures=True)
+                                        break
 
-                                try:
-                                    res = fut.result(timeout=timeout + 30)
-                                except Exception as e:
-                                    src_row = fmap[fut]
-                                    res = {
-                                        "URL":                  str(src_row.get("URL", "")),
-                                        "Keyword":              str(src_row.get("Keyword", "")),
-                                        "Extraction Option":    "",
-                                        "URL_Status":           0,
-                                        "URL_Search_Status":    f"Exception: {e}",
-                                        "Keyword_Status":       None,
-                                        "feature_name":         str(src_row.get("Keyword", "")),
-                                        "feature_value":        "",
-                                        "Keyword_Search_Status": S.FAILED,
-                                        "_retry":               True,
-                                    }
+                                    try:
+                                        res = fut.result(timeout=timeout + 30)
+                                    except Exception as e:
+                                        src_row = fmap[fut]
+                                        res = {
+                                            "URL":                  str(src_row.get("URL", "")),
+                                            "Keyword":              str(src_row.get("Keyword", "")),
+                                            "Extraction Option":    "",
+                                            "URL_Status":           0,
+                                            "URL_Search_Status":    f"Exception: {e}",
+                                            "Keyword_Status":       None,
+                                            "feature_name":         str(src_row.get("Keyword", "")),
+                                            "feature_value":        "",
+                                            "Keyword_Search_Status": S.FAILED,
+                                            "_retry":               True,
+                                        }
 
-                                completed[0] += 1
-                                kss = res.get("Keyword_Search_Status", "")
-                                _log(f"[{label}][{completed[0]}/{total}] "
-                                     f"{kss[:18]:18s} …{str(res.get('URL',''))[-45:]}")
+                                    completed[0] += 1
+                                    kss = res.get("Keyword_Search_Status", "")
+                                    _log(f"[{label}][{completed[0]}/{total}] "
+                                         f"{kss[:18]:18s} …{str(res.get('URL',''))[-45:]}")
 
-                                pass_results.append(res)
+                                    pass_results.append(res)
 
-                                if res.get("_retry"):
-                                    pass_retry.append(fmap[fut])
+                                    if res.get("_retry"):
+                                        pass_retry.append(fmap[fut])
 
-                                if completed[0] % 100 == 0:
-                                    _autosave(all_results + pass_results, completed[0], total)
-                                    _log(f"💾 Saved {completed[0]:,} rows to disk")
+                                    # Save every 100 completed rows (row-count trigger)
+                                    now = time.time()
+                                    due_by_count = completed[0] % 100 == 0
+                                    due_by_time  = (now - last_save_time) >= SAVE_EVERY_SECS
 
-                                every = max(1, min(20, total // 50))
-                                if completed[0] % every == 0 or completed[0] == total:
-                                    _refresh_ui(label)
+                                    if due_by_count or due_by_time:
+                                        ok = _autosave(all_results + pass_results, completed[0], total)
+                                        last_save_time = now
+                                        if due_by_count:
+                                            _log(f"💾 Saved {completed[0]:,} rows to disk"
+                                                 f"{'' if ok else '  ⚠️ save failed'}")
+                                        elif due_by_time:
+                                            _log(f"💾 Checkpoint saved ({completed[0]:,} rows, "
+                                                 f"connection-stall safeguard)"
+                                                 f"{'' if ok else '  ⚠️ save failed'}")
+
+                                    every = max(1, min(20, total // 50))
+                                    if completed[0] % every == 0 or completed[0] == total:
+                                        _refresh_ui(label)
+
+                        finally:
+                            # Guaranteed save of whatever completed so far —
+                            # runs even if the pass is interrupted by an
+                            # unhandled exception, network drop, or the
+                            # user closing the browser tab mid-run.
+                            _autosave(all_results + pass_results, completed[0], total)
 
                         return pass_results, pass_retry
 
                     # ── Pass 1 ─────────────────────────────────────
-                    _log(f"🚀 Pass 1 — {total:,} URLs · {workers} workers")
-                    p1_res, p1_retry = _run_pass(rows, "Pass1")
-                    all_results.extend(p1_res)
+                    try:
+                        _log(f"🚀 Pass 1 — {total:,} URLs · {workers} workers")
+                        p1_res, p1_retry = _run_pass(rows, "Pass1")
+                        all_results.extend(p1_res)
 
-                    # ── Pass 2 — retry transient failures ───────────
-                    if p1_retry and st.session_state.running:
-                        _log(f"♻️ Pass 2 — retrying {len(p1_retry):,} failed URLs…")
-                        retry_keys = {r.get("URL", "") + "|" + r.get("Keyword", "")
-                                      for r in p1_retry}
-                        all_results = [
-                            r for r in all_results
-                            if r.get("URL", "") + "|" + r.get("Keyword", "") not in retry_keys
-                        ]
-                        total += len(p1_retry)
-                        _log("⏳ 12 s cooldown before Pass 2…")
-                        time.sleep(12)
-                        p2_res, still = _run_pass(p1_retry, "Pass2", extra_delay=0.5)
-                        all_results.extend(p2_res)
-                        msg = "✅ All resolved in Pass 2" if not still \
-                              else f"⚠️ {len(still):,} still failed"
-                        _log(msg)
+                        # ── Pass 2 — retry transient failures ───────────
+                        if p1_retry and st.session_state.running:
+                            _log(f"♻️ Pass 2 — retrying {len(p1_retry):,} failed URLs…")
+                            retry_keys = {r.get("URL", "") + "|" + r.get("Keyword", "")
+                                          for r in p1_retry}
+                            all_results = [
+                                r for r in all_results
+                                if r.get("URL", "") + "|" + r.get("Keyword", "") not in retry_keys
+                            ]
+                            total += len(p1_retry)
+                            _autosave(all_results, completed[0], total)  # checkpoint before cooldown
+                            _log("⏳ 12 s cooldown before Pass 2…")
+                            time.sleep(12)
+                            p2_res, still = _run_pass(p1_retry, "Pass2", extra_delay=0.5)
+                            all_results.extend(p2_res)
+                            msg = "✅ All resolved in Pass 2" if not still \
+                                  else f"⚠️ {len(still):,} still failed"
+                            _log(msg)
+                    finally:
+                        # Crash-safe: persist everything gathered so far no
+                        # matter how this block exits (exception, network
+                        # drop, manual stop, or normal completion).
+                        _autosave(all_results, completed[0], total)
 
                     st.session_state.running = False
 
