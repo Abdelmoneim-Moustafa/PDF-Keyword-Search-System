@@ -378,51 +378,154 @@ def _get_alternate_urls(url: str) -> list:
     return alts
 
 
-def _download_one(url: str, timeout: int, fresh: bool = False):
-    """
-    Single download attempt.
-    Returns (content_bytes, error_category) where category is:
-      ""        — success
-      "403"     — access denied (try mirror)
-      "404"     — not found (permanent, stop)
-      "429"     — rate limited (pause, try mirror)
-      "timeout" — read timeout (retry)
-      "ssl"     — TLS error (retry with fresh session)
-      "connection" — TCP error (retry with fresh session)
-      "http_NNN"   — other HTTP error
-    """
-    host = _host(url)
-    _wait_if_blocked(host)
-    _rate_limit(host)
+# ── curl_cffi availability (Chrome TLS fingerprint bypass) ───────────────────
+try:
+    from curl_cffi import requests as _cf_requests
+    _CURL_CFFI_OK = True
+except ImportError:
+    _CURL_CFFI_OK = False
+
+
+def _origin(url: str) -> str:
+    try:    return "/".join(url.split("/")[:3]) + "/"
+    except: return "https://source.z2data.com/"
+
+
+def _try_requests(url: str, timeout: int, fresh: bool = False) -> tuple:
+    """Layer 1: standard requests — fast, works for PDFs and simple HTML."""
     session = _get_session(fresh=fresh)
-    # Set Referer dynamically: use the URL's own origin so the server sees a
-    # same-origin request — required by z2data and most product portals.
     try:
-        parts = url.split("/")
-        origin = "/".join(parts[:3]) + "/"  # e.g. https://sieportal.siemens.com/
-    except Exception:
-        origin = "https://source.z2data.com/"
-    try:
-        resp = session.get(url, timeout=(_CONNECT_TIMEOUT, timeout),
-                           stream=False, allow_redirects=True,
-                           headers={"Referer": origin})
+        resp = session.get(
+            url,
+            timeout=(_CONNECT_TIMEOUT, timeout),
+            stream=False,
+            allow_redirects=True,
+            headers={"Referer": _origin(url)},
+        )
         if resp.status_code == 200:
-            _record_success(host)
             return resp.content, ""
-        _record_failure(host)
         code = resp.status_code
         if code in (404, 410): return None, "404"
-        if code == 403:        return None, "403"   # FIX 1: was "blocked" — now tries mirror
+        if code == 403:        return None, "403"
         if code == 429:
             time.sleep(4 + random.random() * 4)
-            return None, "429"                      # FIX 1: was "blocked" — now tries mirror
+            return None, "429"
         return None, f"http_{code}"
     except Exception as e:
-        _record_failure(host)
         s = str(e).lower()
         if any(w in s for w in ("ssl", "cert", "tls", "handshake")): return None, "ssl"
         if any(w in s for w in ("timed out", "timeout", "read timed")): return None, "timeout"
         return None, "connection"
+
+
+def _try_curl_cffi(url: str, timeout: int) -> tuple:
+    """
+    Layer 2: curl_cffi Chrome impersonation.
+    Mimics Chrome's exact TLS fingerprint (JA3/JA4) — bypasses Akamai,
+    Cloudflare, and most bot-managers that reject plain requests.
+    """
+    if not _CURL_CFFI_OK:
+        return None, "403"
+    try:
+        r = _cf_requests.get(
+            url,
+            impersonate="chrome124",
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"Referer": _origin(url)},
+        )
+        if r.status_code == 200:
+            return r.content, ""
+        code = r.status_code
+        if code in (404, 410): return None, "404"
+        if code == 403:        return None, "403"
+        if code == 429:
+            time.sleep(3 + random.random() * 3)
+            return None, "429"
+        return None, f"http_{code}"
+    except Exception as e:
+        s = str(e).lower()
+        if any(w in s for w in ("timed out", "timeout")): return None, "timeout"
+        return None, "connection"
+
+
+def _try_playwright(url: str, timeout: int) -> tuple:
+    """
+    Layer 3: Playwright headless Chrome.
+    Full JS execution — handles SPAs that require JavaScript to render content.
+    Only used as final fallback when layers 1 and 2 both return 403.
+    Slower (~3–8 s per page) but works on any site a real browser can open.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, "403"
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            ctx     = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+            )
+            page = ctx.new_page()
+            page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+            # Wait briefly for JS to populate the DOM
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            content = page.content().encode("utf-8")
+            browser.close()
+            return content, ""
+    except Exception as e:
+        s = str(e).lower()
+        if "timeout" in s: return None, "timeout"
+        return None, "connection"
+
+
+def _download_one(url: str, timeout: int, fresh: bool = False) -> tuple:
+    """
+    3-layer download strategy:
+      Layer 1: requests          — fast, works for PDFs + simple HTML
+      Layer 2: curl_cffi         — Chrome TLS fingerprint, bypasses Akamai/CF
+      Layer 3: Playwright        — real headless Chrome, handles JS SPAs
+    Each layer is only tried if the previous one returned 403.
+    Other errors (404, timeout, SSL) are returned immediately.
+    """
+    host = _host(url)
+    _wait_if_blocked(host)
+    _rate_limit(host)
+
+    # Layer 1: standard requests
+    content, cat = _try_requests(url, timeout, fresh=fresh)
+    if content is not None:
+        _record_success(host)
+        return content, ""
+    if cat != "403":           # non-403 error → return immediately
+        _record_failure(host)
+        return None, cat
+
+    # Layer 2: curl_cffi Chrome TLS fingerprint
+    content, cat = _try_curl_cffi(url, timeout)
+    if content is not None:
+        _record_success(host)
+        return content, ""
+    if cat != "403":
+        _record_failure(host)
+        return None, cat
+
+    # Layer 3: Playwright headless Chrome (final fallback)
+    content, cat = _try_playwright(url, timeout)
+    if content is not None:
+        _record_success(host)
+        return content, ""
+
+    _record_failure(host)
+    return None, cat
 
 
 def _fetch(url: str, session_timeout: int, use_mirror: bool = True):
@@ -500,19 +603,102 @@ def _extract_pdf(data: bytes):
         return "", f"error:{e}"
 
 
-class _HtmlStripper(HTMLParser):
+class _HtmlExtractor(HTMLParser):
+    """
+    Extracts text from HTML pages including JavaScript SPAs.
+    Collects two layers:
+      1. Visible text  — same as before (strips script/style/head)
+      2. Script data   — JSON blobs embedded in <script> tags
+                         (window.__STATE__, __NEXT_DATA__, ld+json, etc.)
+    Many product portals (Siemens, Mouser, Digi-Key) are React/Angular SPAs
+    that ship all product data as JSON inside <script> tags in the initial HTML.
+    requests sees this JSON even though a browser renders it via JS.
+    """
     def __init__(self):
         super().__init__()
-        self.parts = []
-        self._skip = False
+        self.visible = []   # visible text (existing behavior)
+        self.scripts = []   # raw script tag contents
+        self._skip   = False
+        self._script = False
+
     def handle_starttag(self, tag, attrs):
-        if tag in ("script", "style", "noscript", "head"): self._skip = True
+        attr_dict = dict(attrs)
+        if tag in ("style", "noscript"):
+            self._skip = True
+        elif tag == "head":
+            self._skip = True          # skip head visible text but still capture scripts
+        elif tag == "script":
+            self._skip   = False
+            self._script = True
+        # Capture data-* attribute values (product codes often stored here)
+        if not self._skip and not self._script:
+            for k, v in attrs:
+                if k.startswith("data-") and v and len(v) > 2:
+                    self.visible.append(v)
+
     def handle_endtag(self, tag):
-        if tag in ("script", "style", "noscript", "head"): self._skip = False
+        if tag in ("style", "noscript", "head"):
+            self._skip = False
+        elif tag == "script":
+            self._script = False
+
     def handle_data(self, data):
-        if not self._skip:
-            s = data.strip()
-            if s: self.parts.append(s)
+        s = data.strip()
+        if not s:
+            return
+        if self._script:
+            self.scripts.append(s)     # capture script content
+        elif not self._skip:
+            self.visible.append(s)     # capture visible text
+
+
+def _json_values(script_text: str) -> str:
+    """
+    Pull string values out of JSON embedded in <script> tags.
+    Handles: window.__STATE__, __NEXT_DATA__, application/ld+json, inline JSON.
+    Only returns values that look like real data (length > 2, not pure JS syntax).
+    """
+    import json as _json
+    results = []
+
+    def _walk(obj, depth=0):
+        if depth > 10:
+            return
+        if isinstance(obj, str) and len(obj) > 2:
+            results.append(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item, depth + 1)
+
+    # Find JSON objects/arrays embedded in the script text
+    # Use a simple brace-counting scanner to find JSON boundaries
+    for start_ch, end_ch in [('{', '}'), ('[', ']')]:
+        i = 0
+        while i < len(script_text):
+            pos = script_text.find(start_ch, i)
+            if pos == -1:
+                break
+            # Find matching closing bracket
+            depth, end = 0, pos
+            for j in range(pos, min(pos + 200_000, len(script_text))):
+                if script_text[j] == start_ch:   depth += 1
+                elif script_text[j] == end_ch:
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            if end > pos + 20:          # only try non-trivial JSON
+                try:
+                    obj = _json.loads(script_text[pos:end + 1])
+                    _walk(obj)
+                except Exception:
+                    pass
+            i = pos + 1
+
+    return "\n".join(results)
 
 
 def _extract_html(data: bytes):
@@ -521,10 +707,18 @@ def _extract_html(data: bytes):
         for enc in ("utf-8", "latin-1", "cp1252"):
             try: html = data.decode(enc); break
             except Exception: pass
-        if not html: html = data.decode("utf-8", errors="replace")
-        p = _HtmlStripper(); p.feed(html)
-        text = "\n".join(p.parts)
-        return (text, "searchable") if text.strip() else ("", "scanned")
+        if not html:
+            html = data.decode("utf-8", errors="replace")
+
+        extractor = _HtmlExtractor()
+        extractor.feed(html)
+
+        visible_text = "\n".join(extractor.visible).strip()
+        json_text    = _json_values("\n".join(extractor.scripts))
+
+        # Visible text first (highest quality), then JSON values from scripts
+        combined = "\n".join(filter(None, [visible_text, json_text]))
+        return (combined, "searchable") if combined.strip() else ("", "scanned")
     except Exception as e:
         return "", f"error:{e}"
 
@@ -584,20 +778,96 @@ def _extract(content: bytes, is_html: bool):
 
 # URL-level text cache — same document never extracted twice
 _cache_lock = threading.Lock()
-_url_cache: dict = {}
+_url_cache: dict = {}          # in-memory layer (fast lookup this run)
+
+# ── Persistent URL result cache ───────────────────────────────────────────────
+# Stores URL → (text, status) on disk so re-running the same file is instant.
+# Cache key = SHA-256 of URL (avoids filesystem-illegal characters).
+# Each entry is a small JSON file under _URL_CACHE_DIR.
+_URL_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".pdf_search_cache")
+os.makedirs(_URL_CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(url: str) -> str:
+    import hashlib
+    key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return os.path.join(_URL_CACHE_DIR, key + ".json")
+
+
+def _load_disk_cache(url: str):
+    """Return (text, status) from disk cache, or None if not cached."""
+    try:
+        path = _cache_path(url)
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return d.get("text", ""), d.get("status", "searchable")
+    except Exception:
+        pass
+    return None
+
+
+def _save_disk_cache(url: str, text: str, status: str):
+    """Persist (text, status) to disk cache atomically."""
+    try:
+        path     = _cache_path(url)
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"url": url, "text": text, "status": status,
+                       "saved": datetime.now().isoformat()}, f, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass
 
 
 def _get_text(url: str, content: bytes, is_html: bool):
+    # 1. Check in-memory cache (fastest)
     with _cache_lock:
-        if url in _url_cache: return _url_cache[url]
+        if url in _url_cache:
+            return _url_cache[url]
+
+    # 2. Check persistent disk cache (fast — avoids re-download on re-run)
+    cached = _load_disk_cache(url)
+    if cached is not None:
+        with _cache_lock:
+            _url_cache[url] = cached
+        return cached
+
+    # 3. Extract from downloaded bytes and persist both caches
     result = _extract(content, is_html)
+    text, status = result
     with _cache_lock:
         _url_cache[url] = result
+    if status == "searchable" and text.strip():
+        _save_disk_cache(url, text, status)
     return result
 
 
 def _clear_text_cache():
-    with _cache_lock: _url_cache.clear()
+    """Clear in-memory cache only. Disk cache is preserved across runs."""
+    with _cache_lock:
+        _url_cache.clear()
+
+
+def _get_cache_stats() -> dict:
+    """Return disk cache stats for the sidebar display."""
+    try:
+        files = [f for f in os.listdir(_URL_CACHE_DIR) if f.endswith(".json")]
+        size  = sum(os.path.getsize(os.path.join(_URL_CACHE_DIR, f)) for f in files)
+        return {"count": len(files), "size_kb": round(size / 1024, 1)}
+    except Exception:
+        return {"count": 0, "size_kb": 0}
+
+
+def _clear_disk_cache():
+    """Delete all persistent cache files."""
+    try:
+        for f in os.listdir(_URL_CACHE_DIR):
+            if f.endswith(".json") or f.endswith(".json.tmp"):
+                try: os.remove(os.path.join(_URL_CACHE_DIR, f))
+                except Exception: pass
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -681,6 +951,36 @@ def process_one_url(url: str, raw_keyword: str,
     # Actual detection is done by _sniff_content_type() inside _extract().
     _url_ext_hint = url.lower().split("?")[0]
     is_html_hint  = _url_ext_hint.endswith((".html", ".htm"))
+
+    # ── Check persistent cache before downloading ─────────────────
+    # If this URL was successfully extracted in a previous run, skip the
+    # download entirely and search the cached text immediately.
+    cached = _load_disk_cache(url)
+    if cached is not None:
+        cached_text, cached_status = cached
+        if cached_status == "searchable" and cached_text.strip():
+            norm = _normalize(cached_text)
+            keywords = _parse_keywords(raw_keyword)
+            if not keywords:
+                keywords = [raw_keyword]
+            found_kws, total_count, first_snippet = [], 0, ""
+            for kw in keywords:
+                cnt = _search_keyword(norm, kw, case_sensitive)
+                if cnt > 0:
+                    found_kws.append(kw)
+                    total_count += cnt
+                    if not first_snippet:
+                        first_snippet = _best_snippet(norm, kw)
+            if found_kws:
+                return done(URL_Status=3, URL_Search_Status="Done (cached)",
+                            Keyword_Status=3.0,
+                            feature_name=", ".join(found_kws),
+                            feature_value=first_snippet,
+                            Keyword_Search_Status=S.FOUND, _retry=False)
+            return done(URL_Status=3, URL_Search_Status="Done (cached)",
+                        Keyword_Status=3.0,
+                        feature_name=raw_keyword,
+                        Keyword_Search_Status=S.NOT_FOUND, _retry=False)
 
     # ── Download (FIX 1: mirrors tried on 403) ────────────────────
     content, dl_cat = _fetch(url, session_timeout, use_mirror=True)
@@ -997,6 +1297,20 @@ with st.sidebar:
         + _legend_row(_DOT_COLOR[S.FAILED],    "Failed",    "could not download / access"),
         unsafe_allow_html=True,
     )
+
+    # ── URL result cache ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown('<div class="psk-side-title">⚡ URL Result Cache</div>',
+                unsafe_allow_html=True)
+    cs = _get_cache_stats()
+    st.caption(
+        f"**{cs['count']:,}** URLs cached  ·  **{cs['size_kb']:,} KB**\n\n"
+        "Cached URLs skip download entirely on re-run."
+    )
+    if cs["count"] > 0:
+        if st.button("🗑 Clear URL Cache", use_container_width=True):
+            _clear_disk_cache()
+            st.rerun()
 
     # ── Recovery panel ───────────────────────────────────────────
     saved_df, saved_meta = _load_autosave()
@@ -1328,17 +1642,22 @@ with tab_results:
 
         st.caption(f"Showing **{len(flt):,}** of {len(rdf):,} rows")
 
-        display_df = flt.copy()
-        display_df["Keyword_Search_Status"] = display_df["Keyword_Search_Status"].apply(
-            _status_badge_html
+        # Fast native dataframe — no HTML rendering overhead.
+        # st.dataframe uses Arrow serialization: renders 50k rows in milliseconds.
+        st.dataframe(
+            flt,
+            use_container_width=True,
+            height=440,
+            column_config={
+                "Keyword_Search_Status": st.column_config.TextColumn(
+                    "Status", width="medium"
+                ),
+                "URL": st.column_config.LinkColumn("URL", width="large"),
+                "feature_value": st.column_config.TextColumn(
+                    "Snippet", width="large"
+                ),
+            },
         )
-        if len(display_df) <= 300:
-            st.markdown(
-                display_df.to_html(escape=False, index=False),
-                unsafe_allow_html=True,
-            )
-        else:
-            st.dataframe(flt, use_container_width=True, height=440)
 
         st.markdown("---")
         st.markdown('<div class="psk-section-label">Download Results</div>',
